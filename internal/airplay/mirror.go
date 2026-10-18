@@ -7,7 +7,6 @@ import (
 	"crypto/rand"
 	"crypto/sha512"
 	"encoding/binary"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -370,7 +369,7 @@ func (c *AirPlayClient) requestSetup(uri, phase string, request map[string]inter
 		// usable. The caller must still release the session it just created.
 		return nil, headers, receivedAt, true, true, fmt.Errorf("unmarshal %s SETUP response: %w", phase, err)
 	}
-	dbg("[SETUP] %s response: %+v", phase, response)
+	debugDumpPlist(phase+" response", response)
 	return response, headers, receivedAt, true, true, nil
 }
 
@@ -461,6 +460,12 @@ func (c *AirPlayClient) closeUnsafeMirrorControlConnection() {
 
 // setupMirrorSession negotiates the mirroring stream with the Apple TV.
 func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig, prepareVideoCapture func(width, height int, codec VideoCodec) (VideoPreparationResult, error), captureMayReportMinimumLead bool) (*MirrorSession, error) {
+	if cfg.NoEncrypt {
+		return nil, fmt.Errorf("unencrypted mirroring is disabled in this fork")
+	}
+	if !c.encrypted || !c.PairKeys.hasReceiverIdentity() {
+		return nil, fmt.Errorf("mirroring requires an authenticated, encrypted control channel")
+	}
 	if err := ValidateVideoCodec(string(cfg.VideoCodec)); err != nil {
 		return nil, err
 	}
@@ -508,12 +513,10 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 		encIV = c.streamIV
 	}
 
-	if cfg.NoEncrypt {
-		dbg("[SETUP] video frame encryption DISABLED (--no-encrypt mode)")
-		encKey = nil
-		encIV = nil
-	} else if encKey != nil {
+	if encKey != nil {
 		dbg("[SETUP] using encryption (key: %d bytes, IV: %d bytes)", len(encKey), len(encIV))
+	} else {
+		return nil, fmt.Errorf("video encryption key is unavailable")
 	}
 
 	// Allocate separate consecutive sockets for timing, RTCP, and RTP. Only the
@@ -607,7 +610,9 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 		audioIV = c.fpIV
 		dbg("[SETUP] audio encryption: AES-128-CBC (fpKey/hashed %d bytes)", len(audioKey))
 	} else if audioMode == audioSecurityLegacyAES {
-		dbg("[SETUP] audio encryption: disabled (no FairPlay key available)")
+		if !cfg.NoAudio {
+			return nil, fmt.Errorf("audio encryption key is unavailable; use -no-audio for video-only mirroring")
+		}
 	}
 
 	audioDataPort := 0
@@ -1187,8 +1192,6 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 		session.chachaCipher = aead
 		dbg("[SETUP] using ChaCha20-Poly1305 (HKDF-SHA512)")
 		dbg("[SETUP] streamConnectionID: %d", videoStreamConnectionID)
-		dbg("[SETUP] IKM (%d bytes):   %02x", len(ikm), ikm)
-		dbg("[SETUP] chacha key:       %02x", chachaKey)
 	} else if encKey != nil {
 		// AES-CTR path: SHA-512-derived key from shk + streamConnectionID.
 		var cipherKey, cipherIV []byte
@@ -1201,10 +1204,6 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 			dbg("[SETUP] using SHA-512 derived keys (AES-CTR)")
 		}
 		dbg("[SETUP] streamConnectionID: %d", videoStreamConnectionID)
-		dbg("[SETUP] shk (raw key):    %02x", encKey)
-		dbg("[SETUP] shiv (raw IV):    %02x", encIV)
-		dbg("[SETUP] cipher key:       %02x", cipherKey)
-		dbg("[SETUP] cipher IV:        %02x", cipherIV)
 		mc, err := newMirrorCipher(cipherKey, cipherIV)
 		if err != nil {
 			return nil, fmt.Errorf("stream cipher: %w", err)
@@ -1457,13 +1456,7 @@ func (s *MirrorSession) StreamFrames(ctx context.Context, capture *ScreenCapture
 
 		frameData := vclBuf
 		if s.streamCipher != nil {
-			if frameCount < 5 {
-				dbg("[CRYPTO] frame %d plain[0:20]=%02x", frameCount, vclBuf[:min(20, len(vclBuf))])
-			}
 			frameData = s.streamCipher(vclBuf)
-			if frameCount < 5 {
-				dbg("[CRYPTO] frame %d  enc[0:20]=%02x", frameCount, frameData[:min(20, len(frameData))])
-			}
 		}
 
 		keyframeStr := "non-IDR"
@@ -2102,7 +2095,6 @@ func (s *MirrorSession) sendFrame(auData []byte, isKeyframe bool, networkTimesta
 		if s.frameSeq <= 3 {
 			dbg("[CHACHA] nonce=%d nonce_hex=%02x plaintext_len=%d ciphertext_len=%d",
 				s.chachaNonce, nonce[:], len(auData), len(framePayload))
-			dbg("[CHACHA] plaintext[0:min(32)]=%02x", auData[:min(32, len(auData))])
 			dbg("[CHACHA] ciphertext[0:min(32)]=%02x", framePayload[:min(32, len(framePayload))])
 			dbg("[CHACHA] tag=%02x", framePayload[len(framePayload)-16:])
 		}
@@ -2271,9 +2263,9 @@ func (s *MirrorSession) feedbackLoop(ctx context.Context) {
 		}
 		var fbResp map[string]interface{}
 		if _, err := plist.Unmarshal(body, &fbResp); err == nil {
-			dbg("[FEEDBACK] response: %+v", fbResp)
+			debugDumpPlist("feedback response", fbResp)
 		} else {
-			dbg("[FEEDBACK] response (%d bytes): %02x", len(body), body)
+			dbg("[FEEDBACK] response: %d bytes", len(body))
 		}
 	}
 
@@ -2796,7 +2788,9 @@ func debugDumpPlist(label string, m map[string]interface{}) {
 	for _, k := range keys {
 		switch v := m[k].(type) {
 		case []byte:
-			dbg("[SETUP]   %s = <%d bytes> %s", k, len(v), hex.EncodeToString(v[:min(len(v), 16)]))
+			dbg("[SETUP]   %s = <%d bytes>", k, len(v))
+		case string:
+			dbg("[SETUP]   %s = <%d characters>", k, len(v))
 		case map[string]interface{}:
 			inner := make([]string, 0, len(v))
 			for ik := range v {

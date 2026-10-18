@@ -871,9 +871,7 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 		cleanup.run()
 	}
 
-	// A receiver-configured password and an on-screen pairing PIN travel through
-	// the same user-facing field. Pair-setup consumes it first; HTTP Digest may
-	// then require the same value during SETUP. Retain it across reconnects.
+	// A modern receiver's playback password is separate from its pairing PIN.
 	credential := d.cfg.Code
 	if suppliedCredential != "" {
 		credential = suppliedCredential
@@ -937,30 +935,20 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 		screenCastRestoreToken = savedCreds.RestoreToken
 	}
 
-	reconnect := func() error {
-		_ = client.Close()
-		next, nextInfo, err := connectClient()
-		if err != nil {
-			return err
-		}
-		client = next
-		info = nextInfo
-		deviceID = info.DeviceID
-		return nil
-	}
-
 	log.Printf("[daemon] connected to %s (model: %s, deviceID: %s)", info.Name, info.Model, deviceID)
 
 	pairWithCredentialValue := func(value string) error {
-		credential = value
+		if info.RequiredPairingCredential() == airplay.PairingCredentialPassword {
+			credential = value
+			client.SetPassword(value)
+		}
 		if err := client.Pair(ctx, value); err != nil {
 			return err
 		}
 		if client.PairKeys != nil {
-			if err := d.credStore.SavePairing(deviceID, client.PairingID,
-				client.PairKeys.Ed25519Public, client.PairKeys.Ed25519Private,
+			if err := d.credStore.SaveAuthenticatedPairing(deviceID, client.PairingID, client.PairKeys,
 				client.PairingProtocol()); err != nil {
-				log.Printf("[daemon] warning: failed to save credentials: %v", err)
+				return fmt.Errorf("save verified receiver identity: %w", err)
 			} else {
 				log.Printf("[daemon] credentials saved for %s (deviceID: %s)", info.Name, deviceID)
 			}
@@ -1020,11 +1008,8 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 			verifyErr = client.PairVerify(ctx)
 		}
 		if verifyErr != nil {
-			log.Printf("[daemon] pair-verify with saved creds failed: %v", verifyErr)
-			if err := reconnect(); err != nil {
-				removeStream(fmt.Sprintf("reconnect failed: %v", err))
-				return
-			}
+			removeStream(fmt.Sprintf("receiver verification failed: %v; verify the receiver and explicitly pair again using the CLI -pair option", verifyErr))
+			return
 		} else {
 			paired = true
 			log.Printf("[daemon] pair-verify succeeded for %s", info.Name)
@@ -1034,64 +1019,27 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 	}
 
 	if !paired {
-		pairWithCredential := func(kind CredentialKind) error {
-			if credential == "" {
-				value, err := waitForCredential(kind)
-				if err != nil {
-					return fmt.Errorf("wait for %s: %w", kind, err)
-				}
-				credential = value
-				client.SetPassword(credential)
-			}
-			if err := pairWithCredentialValue(credential); err != nil {
-				return fmt.Errorf("%s pairing: %w", kind, err)
-			}
-			return nil
+		kind := CredentialKindPIN
+		pairingCredential := credential
+		if info.RequiredPairingCredential() == airplay.PairingCredentialPassword {
+			kind = CredentialKindPassword
+		} else if info.RequiresPassword() {
+			pairingCredential = ""
 		}
-
-		// Resolve the password/PIN status bits against the pairing generation.
-		// Legacy password receivers consume the password in SRP. Modern receivers
-		// keep it solely for Digest and still perform transient HAP pairing, even
-		// when the receiver also publishes the on-screen PIN bit.
-		switch requiredPairingCredentialKind(info) {
-		case CredentialKindPassword:
-			if err := pairWithCredential(CredentialKindPassword); err != nil {
-				removeStream(err.Error())
+		if pairingCredential == "" {
+			pairingCredential, err = waitForCredential(kind)
+			if err != nil {
+				removeStream(fmt.Sprintf("wait for %s: %v", kind, err))
 				return
 			}
-		case CredentialKindPIN:
-			if err := pairWithCredential(CredentialKindPIN); err != nil {
-				removeStream(err.Error())
-				return
-			}
-		default:
-			if err := client.Pair(ctx, ""); err != nil {
-				log.Printf("[daemon] transient pairing failed: %v", err)
-				// A modern fixed password is an HTTP Digest credential, not an SRP
-				// secret. Do not turn a transient failure into an invalid full setup.
-				if info.RequiresPassword() {
-					removeStream(fmt.Sprintf("transient pairing failed for password-protected receiver: %v", err))
-					return
-				}
-				// A failed setup may leave pairing state attached to this socket. Start
-				// and finish the explicit PIN exchange on a fresh connection.
-				if err := reconnect(); err != nil {
-					removeStream(fmt.Sprintf("reconnect for credential pairing failed: %v", err))
-					return
-				}
-				if err := pairWithCredential(CredentialKindPIN); err != nil {
-					removeStream(err.Error())
-					return
-				}
-			} else {
-				log.Printf("[daemon] transient pairing succeeded for %s", info.Name)
-			}
+		}
+		if err := pairWithCredentialValue(pairingCredential); err != nil {
+			removeStream(fmt.Sprintf("%s pairing: %v", kind, err))
+			return
 		}
 	}
 
-	// A configured playback password is independent from pair-verify. A saved or
-	// transient pairing may succeed without it, but SETUP will later issue a
-	// Digest challenge. Obtain the password once now and retain it for that retry.
+	// A configured playback password is independent from authenticated pairing.
 	if info.RequiresPassword() && credential == "" {
 		value, err := waitForCredential(CredentialKindPassword)
 		if err != nil {

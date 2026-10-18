@@ -15,6 +15,8 @@ type SavedCredentials struct {
 	PairingID       string          `json:"pairing_id"`
 	Ed25519Public   []byte          `json:"ed25519_public"`
 	Ed25519Seed     []byte          `json:"ed25519_seed"` // 32-byte seed (private key is derived from this)
+	ReceiverID      string          `json:"receiver_id,omitempty"`
+	ReceiverPublic  []byte          `json:"receiver_public,omitempty"`
 	PairingProtocol PairingProtocol `json:"pairing_protocol,omitempty"`
 	RestoreToken    string          `json:"restore_token,omitempty"`
 }
@@ -63,16 +65,10 @@ func (c *AirPlayClient) RestorePairingCredentials(saved *SavedCredentials) error
 	if saved == nil || !saved.HasPairingCredentials() {
 		return fmt.Errorf("saved credentials contain no usable pairing identity")
 	}
-	protocol := saved.PairingProtocol
-	if protocol == PairingProtocolUnknown {
-		// Old credential files predate explicit protocol persistence. Preserve the
-		// previous capability-driven behavior: legacy pairing profiles used raw
-		// pair-verify, while CoreUtils/HAP profiles used encrypted verification.
-		protocol = PairingProtocolHAP
-		if c.info != nil && c.info.PrefersLegacyPairing() {
-			protocol = PairingProtocolRaw
-		}
+	if saved.ReceiverID == "" || len(saved.ReceiverPublic) != ed25519.PublicKeySize {
+		return fmt.Errorf("saved credentials have no verified receiver identity; verify the receiver and pair again with -pair")
 	}
+	protocol := saved.PairingProtocol
 	switch protocol {
 	case PairingProtocolHAP:
 		c.pairingProtocol = pairingProtocolHAP
@@ -83,10 +79,15 @@ func (c *AirPlayClient) RestorePairingCredentials(saved *SavedCredentials) error
 	}
 
 	pub, priv := saved.Ed25519Keys()
+	if !pub.Equal(priv.Public()) {
+		return fmt.Errorf("saved pairing public and private keys do not match")
+	}
 	c.PairingID = saved.PairingID
 	c.PairKeys = &PairKeys{
 		Ed25519Public:  append(ed25519.PublicKey(nil), pub...),
 		Ed25519Private: append(ed25519.PrivateKey(nil), priv...),
+		ReceiverID:     saved.ReceiverID,
+		ReceiverPublic: append(ed25519.PublicKey(nil), saved.ReceiverPublic...),
 	}
 	return nil
 }
@@ -141,19 +142,33 @@ func (cs *CredentialStore) Len() int {
 
 // Save stores credentials for a device.
 func (cs *CredentialStore) Save(deviceID string, pairingID string, pub ed25519.PublicKey, priv ed25519.PrivateKey) error {
-	return cs.savePairing(deviceID, pairingID, pub, priv, PairingProtocolUnknown)
+	return cs.savePairing(deviceID, pairingID, pub, priv, PairingProtocolUnknown, "", nil)
 }
 
 // SavePairing stores credentials together with the protocol which actually
-// completed. New production call sites should use this instead of Save.
+// completed. Use SaveAuthenticatedPairing to preserve receiver verification.
 func (cs *CredentialStore) SavePairing(deviceID string, pairingID string, pub ed25519.PublicKey, priv ed25519.PrivateKey, protocol PairingProtocol) error {
 	if protocol != PairingProtocolHAP && protocol != PairingProtocolRaw {
 		return fmt.Errorf("cannot save unknown pairing protocol %q", protocol)
 	}
-	return cs.savePairing(deviceID, pairingID, pub, priv, protocol)
+	return cs.savePairing(deviceID, pairingID, pub, priv, protocol, "", nil)
 }
 
-func (cs *CredentialStore) savePairing(deviceID string, pairingID string, pub ed25519.PublicKey, priv ed25519.PrivateKey, protocol PairingProtocol) error {
+// SaveAuthenticatedPairing retains the receiver identity verified during pairing.
+func (cs *CredentialStore) SaveAuthenticatedPairing(deviceID, pairingID string, keys *PairKeys, protocol PairingProtocol) error {
+	if !keys.hasReceiverIdentity() {
+		return fmt.Errorf("cannot save pairing without a verified receiver identity")
+	}
+	if protocol != PairingProtocolHAP && protocol != PairingProtocolRaw {
+		return fmt.Errorf("cannot save unknown pairing protocol %q", protocol)
+	}
+	return cs.savePairing(deviceID, pairingID, keys.Ed25519Public, keys.Ed25519Private, protocol, keys.ReceiverID, keys.ReceiverPublic)
+}
+
+func (cs *CredentialStore) savePairing(deviceID string, pairingID string, pub ed25519.PublicKey, priv ed25519.PrivateKey, protocol PairingProtocol, receiverID string, receiverPublic ed25519.PublicKey) error {
+	if deviceID == "" || pairingID == "" || len(pub) != ed25519.PublicKeySize || len(priv) != ed25519.PrivateKeySize || !pub.Equal(priv.Public()) {
+		return fmt.Errorf("cannot save invalid pairing identity")
+	}
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 
@@ -167,6 +182,8 @@ func (cs *CredentialStore) savePairing(deviceID string, pairingID string, pub ed
 	creds.PairingID = pairingID
 	creds.Ed25519Public = append([]byte(nil), pub...)
 	creds.Ed25519Seed = append([]byte(nil), priv.Seed()...)
+	creds.ReceiverID = receiverID
+	creds.ReceiverPublic = append([]byte(nil), receiverPublic...)
 	if protocol != PairingProtocolUnknown {
 		creds.PairingProtocol = protocol
 	}
@@ -235,8 +252,23 @@ func (fb *fileBackend) persist() error {
 	if err != nil {
 		return fmt.Errorf("marshal credential store: %w", err)
 	}
-	if err := os.WriteFile(fb.path, data, 0600); err != nil {
+	file, err := os.CreateTemp(dir, ".credentials-*")
+	if err != nil {
+		return fmt.Errorf("create credential file: %w", err)
+	}
+	defer os.Remove(file.Name())
+	defer file.Close()
+	if _, err := file.Write(data); err != nil {
 		return fmt.Errorf("write credential store: %w", err)
+	}
+	if err := file.Sync(); err != nil {
+		return fmt.Errorf("sync credential store: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close credential store: %w", err)
+	}
+	if err := os.Rename(file.Name(), fb.path); err != nil {
+		return fmt.Errorf("replace credential store: %w", err)
 	}
 	return nil
 }

@@ -167,10 +167,8 @@ func (i *ReceiverInfo) RequiresPINPairing() bool {
 	return i != nil && i.StatusFlags&statusFlagPINRequiredForPairing != 0
 }
 
-// RequiredPairingCredential resolves the receiver's password and PIN flags
-// against its pairing generation. Some modern receivers advertise both: the
-// fixed password takes precedence for the user-facing prompt, but is retained
-// exclusively for Digest while transient HAP pairing proceeds without a code.
+// RequiredPairingCredential identifies an advertised SRP credential. Modern
+// playback passwords authenticate Digest; pairing uses a separate on-screen PIN.
 func (i *ReceiverInfo) RequiredPairingCredential() PairingCredential {
 	if i == nil {
 		return PairingCredentialNone
@@ -271,7 +269,7 @@ type HTTPStatusError struct {
 }
 
 func (e *HTTPStatusError) Error() string {
-	return fmt.Sprintf("HTTP %d (body: %s)", e.StatusCode, string(e.Body))
+	return fmt.Sprintf("HTTP %d (%d response bytes)", e.StatusCode, len(e.Body))
 }
 
 // incompleteResponseError marks a request which did not consume one complete
@@ -375,10 +373,7 @@ type AirPlayClient struct {
 	streamKey []byte
 	streamIV  []byte
 
-	// HTTP Digest credentials, used only when the receiver has "Require
-	// Password" enabled and challenges a request with 401. Pair-setup and
-	// Digest are separate protocols, but a non-empty Pair code is retained here
-	// because receivers may use the same user-facing value for both.
+	// Playback password for HTTP Digest, separate from modern pairing PINs.
 	authPassword string
 	// Most recent Digest challenge seen on this connection. Cached so later
 	// requests can authenticate up front instead of relying on a retry.
@@ -532,7 +527,7 @@ func (c *AirPlayClient) getInfoWithTimeout(timeout time.Duration) (*ReceiverInfo
 		return nil, err
 	}
 
-	// Log the full /info response for debugging audio format support
+	// Log response structure without copying peer-supplied values into logs.
 	var fullInfo map[string]interface{}
 	if _, err2 := plist.Unmarshal(resp, &fullInfo); err2 == nil {
 		dbg("[INFO] full /info response keys: %v", func() []string {
@@ -542,11 +537,6 @@ func (c *AirPlayClient) getInfoWithTimeout(timeout time.Duration) (*ReceiverInfo
 			}
 			return keys
 		}())
-		for _, key := range []string{"audioFormats", "audioLatencies", "displays", "features", "featuresEx", "statusFlags", "initialVolume", "volumeControlType", "keepAliveSendStatsAsBody", "supportedAudioFormatsExtended", "supportedFormats", "PTPInfo"} {
-			if v, ok := fullInfo[key]; ok {
-				dbg("[INFO] %s: %+v", key, v)
-			}
-		}
 	}
 
 	var info ReceiverInfo
@@ -758,19 +748,13 @@ func parseTXTWire(data []byte) map[string]string {
 }
 
 func (c *AirPlayClient) Pair(ctx context.Context, pin string) error {
-	if pin != "" {
-		c.SetPassword(pin)
-		// Current receivers use a configured playback password for HTTP Digest,
-		// not SRP. Keep the caller's single credential for Digest while probing
-		// transient pairing with the empty HAP secret. Legacy receivers advertise
-		// that their password belongs in full pair-setup instead.
-		if c.info != nil && c.info.RequiresPassword() &&
-			c.info.RequiredPairingCredential() == PairingCredentialNone {
-			return c.pairTransient(ctx)
-		}
-		return c.pairWithPIN(ctx, pin)
+	if pin == "" {
+		return ErrPINRequired
 	}
-	return c.pairTransient(ctx)
+	if c.info != nil && c.info.RequiredPairingCredential() == PairingCredentialPassword {
+		c.SetPassword(pin)
+	}
+	return c.pairWithPIN(ctx, pin)
 }
 
 func (c *AirPlayClient) SetupMirror(ctx context.Context, cfg StreamConfig) (*MirrorSession, error) {
@@ -1018,7 +1002,7 @@ func (c *AirPlayClient) readHTTPResponseWithTimeout(timeout time.Duration) ([]by
 	defer c.conn.SetReadDeadline(time.Time{})
 
 	if c.encrypted {
-		dbg("[READ] reading encrypted response (readKey=%s, readNonce=%d)", hex.EncodeToString(c.encReadKey[:8]), c.encReadNonce)
+		dbg("[READ] reading encrypted response (readNonce=%d)", c.encReadNonce)
 		body, headers, err := c.readEncryptedHTTPResponse()
 		return body, headers, markIncompleteResponse(err)
 	}
@@ -1033,7 +1017,7 @@ func (c *AirPlayClient) readPlaintextHTTPResponse() ([]byte, map[string]string, 
 	oneByte := make([]byte, 1)
 	for {
 		if _, err := io.ReadFull(c.conn, oneByte); err != nil {
-			return nil, nil, fmt.Errorf("read response header (got %d bytes so far: %q): %w", headerBuf.Len(), headerBuf.String(), err)
+			return nil, nil, fmt.Errorf("read response header (got %d bytes): %w", headerBuf.Len(), err)
 		}
 		headerBuf.Write(oneByte)
 
@@ -1047,7 +1031,7 @@ func (c *AirPlayClient) readPlaintextHTTPResponse() ([]byte, map[string]string, 
 	}
 
 	header := headerBuf.String()
-	dbg("[READ] plaintext response header:\n%s", header)
+	dbg("[READ] plaintext response header: %d bytes", len(header))
 	statusCode, contentLength, headers, err := parseHTTPHeader(header)
 	if err != nil {
 		return nil, headers, err
@@ -1069,7 +1053,7 @@ func (c *AirPlayClient) readPlaintextHTTPResponse() ([]byte, map[string]string, 
 				return nil, headers, fmt.Errorf("read error response body (%d bytes): %w", contentLength, err)
 			}
 		}
-		dbg("[READ] error response body (%d bytes): %s", len(errBody), hex.EncodeToString(errBody))
+		dbg("[READ] error response body: %d bytes", len(errBody))
 		return nil, headers, &HTTPStatusError{StatusCode: statusCode, Body: errBody}
 	}
 
@@ -1098,9 +1082,6 @@ func (c *AirPlayClient) readEncryptedHTTPResponse() ([]byte, map[string]string, 
 		frame, err := c.readEncryptedFrame()
 		if err != nil {
 			dbg("[ENC-READ] frame %d read error (decrypted so far=%d bytes): %v", frameCount, len(decrypted), err)
-			if len(decrypted) > 0 {
-				dbg("[ENC-READ] partial decrypted data hex: %s", hex.EncodeToString(decrypted))
-			}
 			return nil, nil, fmt.Errorf("read encrypted response frame %d: %w", frameCount, err)
 		}
 		frameCount++
@@ -1121,7 +1102,7 @@ func (c *AirPlayClient) readEncryptedHTTPResponse() ([]byte, map[string]string, 
 	header := string(decrypted[:headerEnd+4])
 	remaining := decrypted[headerEnd+4:]
 
-	dbg("[ENC-READ] decrypted response header:\n%s", header)
+	dbg("[ENC-READ] decrypted response header: %d bytes", len(header))
 	statusCode, contentLength, headers, err := parseHTTPHeader(header)
 	if err != nil {
 		return nil, headers, err
@@ -1145,7 +1126,7 @@ func (c *AirPlayClient) readEncryptedHTTPResponse() ([]byte, map[string]string, 
 		if len(remaining) > contentLength && contentLength > 0 {
 			remaining = remaining[:contentLength]
 		}
-		dbg("[ENC-READ] error response body (%d bytes): %s", len(remaining), hex.EncodeToString(remaining))
+		dbg("[ENC-READ] error response body: %d bytes", len(remaining))
 		return nil, headers, &HTTPStatusError{StatusCode: statusCode, Body: remaining}
 	}
 
@@ -1265,12 +1246,7 @@ func (c *AirPlayClient) readEncryptedFrame() ([]byte, error) {
 	dbg("[ENC-FRAME] length prefix: %s (plaintext len=%d, will read %d bytes)",
 		hex.EncodeToString(lengthBuf), plaintextLen, plaintextLen+16)
 
-	if plaintextLen == 0 || plaintextLen > 16384 {
-		dbg("[ENC-FRAME] WARNING: suspicious frame length %d — raw bytes on wire may not be encrypted frames", plaintextLen)
-		// Peek at a few more bytes for debugging
-		peek := make([]byte, 32)
-		n, _ := c.conn.Read(peek)
-		dbg("[ENC-FRAME] next %d bytes on wire: %s", n, hex.EncodeToString(peek[:n]))
+	if plaintextLen == 0 || plaintextLen > 1024 {
 		return nil, fmt.Errorf("suspicious frame length %d (expected 1-1024)", plaintextLen)
 	}
 
@@ -1288,8 +1264,7 @@ func (c *AirPlayClient) readEncryptedFrame() ([]byte, error) {
 
 	nonce := make([]byte, 12)
 	binary.LittleEndian.PutUint64(nonce[4:], c.encReadNonce)
-	dbg("[ENC-FRAME] decrypting with nonce=%d key=%s... aad=%s",
-		c.encReadNonce, hex.EncodeToString(c.encReadKey[:8]), hex.EncodeToString(lengthBuf))
+	dbg("[ENC-FRAME] decrypting with nonce=%d", c.encReadNonce)
 	c.encReadNonce++
 
 	plaintext, err := readCipher.Open(nil, nonce, ciphertext, lengthBuf)

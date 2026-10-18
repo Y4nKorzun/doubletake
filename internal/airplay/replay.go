@@ -68,8 +68,6 @@ func newCaptureDecrypter(aesKeyHex string, scid uint64) (*mirrorCipher, error) {
 	}
 
 	cipherKey, cipherIV := deriveVideoKeys(aesKey, int64(scid))
-	dbg("[REPLAY] original capture cipher key: %02x", cipherKey)
-	dbg("[REPLAY] original capture cipher IV:  %02x", cipherIV)
 
 	block, err := aes.NewCipher(cipherKey)
 	if err != nil {
@@ -182,14 +180,6 @@ func (s *MirrorSession) ReplayFrames(ctx context.Context, cfg ReplayConfig) erro
 
 			// Decrypt with original capture's cipher
 			plaintext := decrypter.EncryptFrame(f.payload) // XOR is symmetric
-
-			if sentFrames < 5 {
-				dispLen := len(plaintext)
-				if dispLen > 32 {
-					dispLen = 32
-				}
-				dbg("[REPLAY] frame %d decrypted[0:%d]: %02x", i, dispLen, plaintext[:dispLen])
-			}
 
 			// Re-encrypt with this session's cipher
 			var ciphertext []byte

@@ -2,6 +2,46 @@
 
 AirPlay screen mirroring sender for Linux. Streams your desktop to an Apple TV using the AirPlay mirroring protocol.
 
+## Hardened fork
+
+Modified by Y4nKorzun on 2026-10-18, based on upstream **v0.5.0**.
+The upstream LGPL-3.0-or-later license and incorporated GPL notices are retained.
+
+This fork verifies the receiver's SRP proof and signed identity during pairing,
+stores that identity with the pairing credentials, and verifies it on reconnect.
+Verification failures stop the connection instead of silently pairing again.
+Credentials are replaced atomically with owner-only permissions. Debug logs no
+longer print session keys or plaintext video samples.
+
+First-time connections require authenticated PIN/password pairing. PIN-less
+transient pairing, plaintext control sessions, and `-no-encrypt` are disabled.
+A receiver that supports only transient pairing or plaintext control is not
+supported by this fork. A modern receiver's playback password remains separate
+from its on-screen pairing PIN.
+
+For Linux to Mac, enable **AirPlay Receiver** on the Mac, use a trusted local
+network, and pair with the PIN displayed on that Mac:
+
+```sh
+doubletake -target MAC_IP -pair
+```
+
+Later connections verify the stored receiver identity:
+
+```sh
+doubletake -target MAC_IP
+```
+
+Upstream credentials lack the verified receiver key and require one explicit
+`-pair` after checking the destination device. The daemon also stops on an
+identity mismatch; repair pairing through the CLI only after checking the Mac.
+Optional system-keyring storage remains available with `-cred-backend keyring`.
+Run as your normal user and restrict inbound AirPlay UDP traffic to the receiver.
+
+These source changes have not yet been build-tested or validated with a physical
+receiver. They do not constitute a complete security audit. The device list below
+records upstream compatibility, not validation of this fork.
+
 ## Features
 
 - Full AirPlay mirroring protocol (RTSP/HTTP + encrypted video stream)
@@ -19,7 +59,7 @@ AirPlay screen mirroring sender for Linux. Streams your desktop to an Apple TV u
 
 ## Requirements
 
-- Go 1.23+
+- Go 1.25+
 - GStreamer 1.0 (with plugins-base, plugins-good, plugins-bad, plugins-ugly, libav)
 - PulseAudio utilities (`pactl`; `pulseaudio-utils` on Ubuntu/Debian or the equivalent package on other distributions)
 - PipeWire (Wayland) or X11 for screen capture
@@ -45,13 +85,16 @@ provided by the plugins-bad package. Check availability with
 
 You can also install from the AUR:
 
+The following packages install upstream Doubletake and do **not** include this
+fork's changes. Build from this fork's source to obtain the hardening changes.
+
 - [`doubletake`](https://aur.archlinux.org/packages/doubletake) (stable release package)
 - [`doubletake-git`](https://aur.archlinux.org/packages/doubletake-git) (latest from git)
 - [`doubletake-bin`](https://aur.archlinux.org/packages/doubletake-bin) (prebuilt binary package)
 
-## Tested Devices
+## Upstream Tested Devices
 
-These are devices that have been tested with doubletake. If there are devices not listed here that you have confirmed working or non-functional, please open an issue.
+These are devices reported as tested by upstream Doubletake.
 
 - AppleTV3,2 (2013 3rd generation)
 - AppleTV11,1 (4K, 2021 2nd gen)
@@ -178,11 +221,11 @@ during `-pair`, or the fixed password when "Require Password" is enabled.
 other users via `ps` and lands in shell history. The environment variable takes
 precedence when both are set.
 
-Pairing and Digest authentication remain separate wire protocols, but
-doubletake deliberately uses one credential flow for both: a PIN/password
-entered during pairing is retained for later Digest challenges and reconnects.
-A receiver may consume that value during pairing, Digest auth, both, or neither.
-Supplying `-code` does not by itself trigger re-pairing.
+Pairing and Digest authentication use separate credentials on modern receivers.
+The configured playback password is retained for Digest, while first-time
+pairing separately requests the PIN displayed on the receiver. A pairing PIN
+does not replace the playback password. Supplying `-code` does not by itself
+replace a saved receiver identity; only an explicit `-pair` may do that.
 
 When the capability policy selects first-party CoreUtils/HAP pairing, a
 configured fixed password is reserved for Digest authentication and is never
@@ -190,10 +233,9 @@ reused as an SRP pairing PIN, including with `-pair`. A legacy/HKP pairing flow
 may consume the same entered value during both SRP and Digest when its protocol
 requires it.
 
-The CLI and Plasma applet prompt once after inspecting the receiver's security
-mode. In the Plasma applet, an on-screen PIN uses a visible four-digit field,
-while a configured password uses an unrestricted masked field. Doubletake does
-not request or claim that a PIN is visible in password mode. The daemon exposes
+The CLI and daemon distinguish pairing PIN prompts from playback-password
+prompts. In the Plasma applet, an on-screen PIN uses a visible four-digit field,
+while a configured password uses an unrestricted masked field. The daemon exposes
 the distinction while retaining `doubletake-ctl pin <PIN-or-password>` for
 command compatibility when exactly one receiver is waiting. With concurrent
 prompts, submit each value with `doubletake-ctl connect TARGET PIN-or-password`.
@@ -273,7 +315,7 @@ doubletake-ctl disconnect
 | `-target-latency-ms` | 0 | Joint audio/video playout latency override in milliseconds (`0` = automatic wired/wireless profiles with separate audio/video defaults) |
 | `-hwaccel` | auto | Encoder preference: `auto`, `nvenc`, `vaapi`, `openh264`, `none` |
 | `-video-codec` | auto | Screen codec: compatible H.264 `auto`, forced `h264`, or forced `hevc` |
-| `-no-encrypt` | false | Disable RTSP header encryption (debugging only) |
+| `-no-encrypt` | false | Rejected by this fork; media encryption is required |
 | `-direct-key` | false | Use `shk`/`shiv` directly without SHA-512 derivation |
 | `-no-audio` | false | Disable audio streaming |
 | `-test` | false | Use synthetic video source |

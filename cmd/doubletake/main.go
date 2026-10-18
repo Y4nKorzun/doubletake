@@ -70,7 +70,7 @@ func main() {
 	hwaccel := flag.String("hwaccel", "auto", "Encoder: auto, nvenc, vaapi, openh264, none (x264/x265)")
 	videoCodec := flag.String("video-codec", "auto", "Screen codec: auto, h264, or hevc (auto uses H.264 for receiver compatibility)")
 	testMode := flag.Bool("test", false, "Use synthetic video (videotestsrc) instead of screen capture for debugging")
-	noEncrypt := flag.Bool("no-encrypt", false, "Disable RTSP header encryption (debugging only; video frames are always encrypted)")
+	noEncrypt := flag.Bool("no-encrypt", false, "Rejected by this fork: media encryption is required")
 	directKey := flag.Bool("direct-key", false, "Use shk/shiv directly without SHA-512 derivation")
 	noAudio := flag.Bool("no-audio", false, "Disable audio streaming")
 	portRange := flag.String("port-range", "", "Local UDP port range for receiver timing/audio (e.g. \"60000-60010\"); empty = OS ephemeral. Needs at least 3 ports.")
@@ -194,17 +194,7 @@ func main() {
 		client.SetPassword(credential)
 	}
 
-	// Pairing flow:
-	// 1. If --pair is forced, do full pair-setup and save credentials.
-	// 2. If saved credentials exist, load them and do pair-verify only.
-	// 3. Pair directly when a legacy receiver requires its configured password,
-	//    or when the receiver advertises one-time PIN pairing.
-	// 4. Otherwise, try transient pairing and use a fresh connection for fallback.
-	//
-	// -code alone does not force pairing. A receiver with "Require Password"
-	// needs the code on every session, so treating its presence as "pair again"
-	// would re-pair on every run and throw away working credentials. When a
-	// pairing PIN is what is actually wanted, -pair asks for one.
+	// Only an explicit -pair may replace an existing receiver identity.
 	needFullPair := *forcePair
 
 	credStore, err := newCredentialStore(*credBackend, *credFile)
@@ -217,59 +207,31 @@ func main() {
 		savedCreds = credStore.Lookup(info.DeviceID)
 	}
 
-	reconnect := func() {
-		_ = client.Close()
-		client = newClient()
-		client.SetPassword(credential)
-		if err := client.Connect(ctx); err != nil {
-			log.Fatalf("reconnect failed: %v", err)
-		}
-		var err error
-		info, err = client.GetInfo()
-		if err != nil {
-			log.Fatalf("get info after reconnect failed: %v", err)
-		}
-	}
-
 	savePairingCredentials := func() {
 		if client.PairKeys == nil {
 			return
 		}
-		if err := credStore.SavePairing(info.DeviceID, client.PairingID,
-			client.PairKeys.Ed25519Public, client.PairKeys.Ed25519Private,
+		if err := credStore.SaveAuthenticatedPairing(info.DeviceID, client.PairingID, client.PairKeys,
 			client.PairingProtocol()); err != nil {
-			log.Printf("warning: failed to save credentials: %v", err)
+			log.Fatalf("failed to save verified receiver identity: %v", err)
 		} else {
 			log.Printf("credentials saved (%s)", *credBackend)
 		}
 	}
 	pairWithCredential := func(value string, expectPIN bool) {
 		if value == "" {
-			value = credentialOrPrompt(credential, client, expectPIN)
+			value = credentialOrPrompt("", client, expectPIN)
 		}
-		// AirPlay uses the same user-entered value for pair-setup and, on
-		// password-protected receivers, the later HTTP Digest challenge.
-		// Keep it for reconnects as well as the current connection.
-		credential = value
+		if passwordRequiresPairing(info) {
+			credential = value
+			client.SetPassword(value)
+		}
 		if err := client.Pair(ctx, value); err != nil {
 			log.Fatalf("pairing failed: %v", err)
 		}
 		savePairingCredentials()
 	}
-	if needFullPair {
-		if forcePairUsesTransient(info) {
-			// A modern receiver's fixed playback password belongs only to HTTP
-			// Digest. Passing it to full SRP pair-setup is rejected as a bad PIN,
-			// even when -pair was requested. Keep the one entered value for Digest
-			// and establish this session with transient HAP pairing.
-			if err := client.Pair(ctx, ""); err != nil {
-				log.Fatalf("transient pairing failed for password-protected receiver: %v", err)
-			}
-		} else {
-			// Full pair-setup with a supplied PIN/password, or request an onscreen PIN.
-			pairWithCredential(credential, !info.RequiresPassword())
-		}
-	} else if savedCreds != nil && savedCreds.HasPairingCredentials() {
+	if savedCreds != nil && savedCreds.HasPairingCredentials() {
 		// Use saved credentials — pair-verify
 		log.Printf("using saved credentials (%s)", *credBackend)
 		verifyErr := restoreSavedPairing(client, savedCreds)
@@ -277,35 +239,15 @@ func main() {
 			verifyErr = client.PairVerify(ctx)
 		}
 		if verifyErr != nil {
-			log.Printf("pair-verify with saved creds failed: %v", verifyErr)
-			reconnect()
-			if passwordRequiresPairing(info) {
-				pairWithCredential("", false)
-			} else if info.RequiredPairingCredential() == airplay.PairingCredentialPIN {
-				pairWithCredential("", true)
-			} else if err := client.Pair(ctx, ""); err != nil {
-				if info.RequiresPassword() {
-					log.Fatalf("transient pairing failed for password-protected receiver: %v", err)
-				}
-				log.Printf("transient pairing fallback failed: %v, requesting pairing credentials", err)
-				// A failed pairing exchange may leave receiver state on this socket.
-				// Start and finish credential pairing together on a clean connection.
-				reconnect()
-				pairWithCredential("", false)
-			}
+			log.Fatalf("receiver verification failed: %v; verify the receiver before explicitly pairing again with -pair", verifyErr)
 		}
 	} else {
 		if passwordRequiresPairing(info) {
-			pairWithCredential("", false)
-		} else if info.RequiredPairingCredential() == airplay.PairingCredentialPIN {
+			pairWithCredential(credential, false)
+		} else if info.RequiresPassword() {
 			pairWithCredential("", true)
-		} else if err := client.Pair(ctx, ""); err != nil {
-			if info.RequiresPassword() {
-				log.Fatalf("transient pairing failed for password-protected receiver: %v", err)
-			}
-			log.Printf("transient pairing failed: %v, requesting pairing credentials", err)
-			reconnect()
-			pairWithCredential("", false)
+		} else {
+			pairWithCredential(credential, true)
 		}
 	}
 	log.Println("pairing complete")
@@ -523,6 +465,9 @@ func credentialOrPrompt(value string, client *airplay.AirPlayClient, expectPIN b
 	reader := bufio.NewReader(os.Stdin)
 	displayErr := client.StartPINDisplay()
 	if displayErr != nil {
+		if expectPIN {
+			log.Fatalf("receiver did not start authenticated PIN pairing: %v", displayErr)
+		}
 		log.Printf("warning: failed to trigger PIN display: %v", displayErr)
 	}
 	credential := readCredential(reader, pairingCredentialPrompt(expectPIN, displayErr))

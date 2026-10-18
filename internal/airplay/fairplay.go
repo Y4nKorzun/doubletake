@@ -103,7 +103,6 @@ func (c *AirPlayClient) FairPlaySetup(ctx context.Context) error {
 	dbg("[FP] ekey chunk2 [56:72]: %02x", ekey[56:72])
 
 	c.fpAesKey = fpAesKey[:]
-	dbg("[FP] wrapped fpAesKey: %02x", fpAesKey[:])
 	dbg("[FP] m3 first 32 bytes: %02x", c.fpM3[:min(32, len(c.fpM3))])
 
 	mixPairVerifyKey := c.PairKeys != nil && c.PairKeys.MixFairPlayKey
@@ -117,9 +116,6 @@ func (c *AirPlayClient) FairPlaySetup(ctx context.Context) error {
 	c.fpKey = finalKey
 
 	dbg("[FP] FairPlay SAP handshake complete!")
-	dbg("[FP] fpAesKey (raw): %02x", c.fpAesKey)
-	dbg("[FP] fpKey (hashed): %02x", c.fpKey)
-	dbg("[FP] stream IV:      %02x", iv[:])
 
 	return nil
 }
