@@ -81,7 +81,7 @@ func TestPINPairSetupRejectsWrongPINAtM3(t *testing.T) {
 	if err == nil {
 		t.Fatal("pairSetup accepted an incorrect PIN")
 	}
-	if !strings.Contains(err.Error(), "M4 error") {
+	if !strings.Contains(err.Error(), "M4:") {
 		t.Fatalf("wrong-PIN error = %q, want M4 authentication rejection", err)
 	}
 
@@ -158,7 +158,7 @@ func servePINPairSetup(conn net.Conn, pin string) (pinSetupServerObservation, er
 
 	// Fixed server parameters keep this side of the exchange deterministic while
 	// the client is still free to generate a fresh SRP private value.
-	salt := []byte("fixed-test-salt")
+	salt := []byte("fixed-test-salt!")
 	b := new(big.Int).SetBytes(bytes.Repeat([]byte{0x5a}, 32))
 	x := pinSetupTestX(salt, pin)
 	v := new(big.Int).Exp(srpG, x, srpN)
@@ -262,7 +262,21 @@ func servePINPairSetup(conn net.Conn, pin string) (pinSetupServerObservation, er
 		return observation, fmt.Errorf("M5 controller signature is invalid")
 	}
 
-	m6 := tlv8EncodeOrdered([]tlv8Item{{Tag: tlvState, Value: []byte{0x06}}})
+	receiverPrivate := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{0x73}, ed25519.SeedSize))
+	receiverPublic := receiverPrivate.Public().(ed25519.PublicKey)
+	receiverID := []byte("pin-setup-receiver")
+	receiverSignKey := pinSetupTestHKDF(sharedKey, []byte("Pair-Setup-Accessory-Sign-Salt"), []byte("Pair-Setup-Accessory-Sign-Info"), 32)
+	receiverSigned := bytes.Join([][]byte{receiverSignKey, receiverID, receiverPublic}, nil)
+	identity := tlv8EncodeOrdered([]tlv8Item{
+		{Tag: tlvIdentifier, Value: receiverID},
+		{Tag: tlvPublicKey, Value: receiverPublic},
+		{Tag: tlvSignature, Value: ed25519.Sign(receiverPrivate, receiverSigned)},
+	})
+	copy(nonce[4:], "PS-Msg06")
+	m6 := tlv8EncodeOrdered([]tlv8Item{
+		{Tag: tlvState, Value: []byte{0x06}},
+		{Tag: tlvEncryptedData, Value: aead.Seal(nil, nonce, identity, nil)},
+	})
 	if err := writeRTSPTestResponse(conn, 200, nil, m6); err != nil {
 		return observation, fmt.Errorf("write M6: %w", err)
 	}

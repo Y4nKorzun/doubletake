@@ -70,7 +70,7 @@ func TestDaemonStreamsToTwoPasswordReceivers(t *testing.T) {
 		receivers = append(receivers, runningReceiver{server: server, done: done, code: cfg.code})
 	}
 
-	socketPath := filepath.Join(t.TempDir(), "doubletake.sock")
+	socketPath := filepath.Join(daemonSocketTestDirectory(t), "doubletake.sock")
 	d, err := New(Config{
 		SocketPath:  socketPath,
 		CredBackend: "file",
@@ -232,6 +232,8 @@ func testDaemonCaptureGroupOrder(t *testing.T, firstSize, secondSize [2]int) {
 		server, err := airplay.NewReceiverServer(airplay.ReceiverConfig{
 			ListenAddress: cfg.address,
 			Profile:       airplay.ReceiverProfileRoku,
+			Auth:          airplay.ReceiverAuthPIN,
+			Code:          "1234",
 			Name:          fmt.Sprintf("Canvas receiver %d", index+1),
 			DisplayWidth:  cfg.size[0],
 			DisplayHeight: cfg.size[1],
@@ -259,7 +261,7 @@ func testDaemonCaptureGroupOrder(t *testing.T, firstSize, secondSize [2]int) {
 		}
 	})
 
-	socketPath := filepath.Join(t.TempDir(), "doubletake.sock")
+	socketPath := filepath.Join(daemonSocketTestDirectory(t), "doubletake.sock")
 	d, err := New(Config{
 		SocketPath:  socketPath,
 		CredBackend: "file",
@@ -297,6 +299,7 @@ func testDaemonCaptureGroupOrder(t *testing.T, firstSize, secondSize [2]int) {
 			Cmd:    "connect",
 			Target: target,
 			Port:   addr.Port,
+			Pin:    "1234",
 		})
 		if !resp.OK {
 			t.Fatalf("queue %s receiver: %+v", target, resp)

@@ -72,6 +72,51 @@ func TestExplicitHEVCSelectionCapsMaximumPreservingAspect(t *testing.T) {
 	}
 }
 
+func TestEveryVideoCodecBoundsReceiverCanvasBeforeEncoding(t *testing.T) {
+	maximumInt := int(^uint(0) >> 1)
+	for _, test := range []struct {
+		name          string
+		width, height int
+		wantW, wantH  int
+		wantError     bool
+	}{
+		{name: "8K receiver", width: 7680, height: 4320, wantW: 3840, wantH: 2160},
+		{name: "wide receiver", width: 7680, height: 2160, wantW: 3840, wantH: 1080},
+		{name: "maximum integers cannot overflow", width: maximumInt, height: maximumInt, wantW: 2160, wantH: 2160},
+		{name: "degenerate height after scaling", width: maximumInt, height: 1080, wantError: true},
+		{name: "degenerate width", width: 1, height: 1080, wantError: true},
+	} {
+		for _, codec := range []VideoCodec{VideoCodecAuto, VideoCodecH264, VideoCodecHEVC} {
+			t.Run(test.name+"/"+string(codec), func(t *testing.T) {
+				info := &ReceiverInfo{
+					Features: uint64(1) << featureScreenMultiCodec,
+					Displays: []DisplayInfo{{
+						WidthPixels: plistNumber(test.width), HeightPixels: plistNumber(test.height),
+						WidthPixelsMax: plistNumber(test.width), HeightPixelsMax: plistNumber(test.height),
+					}},
+				}
+				selection, err := info.selectVideo(codec, false)
+				if test.wantError {
+					if err == nil {
+						t.Fatalf("pathological receiver canvas was accepted: %#v", selection)
+					}
+					return
+				}
+				if err != nil || selection.width != test.wantW || selection.height != test.wantH {
+					t.Fatalf("selected canvas = %dx%d err=%v, want %dx%d", selection.width, selection.height, err, test.wantW, test.wantH)
+				}
+			})
+		}
+	}
+}
+
+func TestMissingReceiverCanvasUsesBoundedBaseline(t *testing.T) {
+	selection, err := (&ReceiverInfo{}).selectVideo(VideoCodecAuto, false)
+	if err != nil || selection.width != 1280 || selection.height != 720 {
+		t.Fatalf("missing receiver canvas selected %dx%d err=%v, want bounded 1280x720", selection.width, selection.height, err)
+	}
+}
+
 func TestExplicitVideoCodecOverridesAutomaticPolicy(t *testing.T) {
 	info := &ReceiverInfo{
 		Features: uint64(1) << featureScreenMultiCodec,

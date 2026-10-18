@@ -31,6 +31,7 @@ type CaptureConfig struct {
 	Bitrate    int        // Video bitrate in kbps (0 = auto)
 	HWAccel    string     // "auto", "nvenc", "vaapi", "openh264", or "none"
 	VideoCodec VideoCodec // empty/h264, auto (resolved before Start), or hevc
+	PortalOnly bool
 
 	// MaxWidth/MaxHeight select the encoded canvas advertised by the receiver.
 	// The captured image is aspect-fitted into it. Zero leaves the capture at
@@ -223,13 +224,9 @@ func PrepareCapture(ctx context.Context, cfg CaptureConfig) (*CapturePreparation
 	if err := ValidateHWAccel(cfg.HWAccel); err != nil {
 		return nil, err
 	}
-	kind := capturePreparationX11
-	if (cfg.X11WindowID != 0 || cfg.X11WindowName != "") && os.Getenv("DISPLAY") != "" {
-		kind = capturePreparationX11
-	} else if os.Getenv("WAYLAND_DISPLAY") != "" {
-		kind = capturePreparationWayland
-	} else if os.Getenv("DISPLAY") == "" {
-		return nil, fmt.Errorf("no display server detected (neither WAYLAND_DISPLAY nor DISPLAY is set)")
+	kind, err := captureKind(cfg)
+	if err != nil {
+		return nil, err
 	}
 
 	validationCfg := cfg
@@ -275,10 +272,12 @@ func PrepareCapture(ctx context.Context, cfg CaptureConfig) (*CapturePreparation
 	if err := exec.Command("gst-inspect-1.0", "pipewiresrc").Run(); err != nil {
 		return nil, fmt.Errorf("GStreamer 'pipewiresrc' plugin not found; install gst-pipewire")
 	}
-	if err := probeWaylandDisplay(ctx, os.Getenv("WAYLAND_DISPLAY")); err != nil {
-		return nil, err
+	if !cfg.PortalOnly {
+		if err := probeWaylandDisplay(ctx, os.Getenv("WAYLAND_DISPLAY")); err != nil {
+			return nil, err
+		}
 	}
-	nodeID, pwFd, portal, restoreToken, err := requestScreencast(ctx, cfg.RestoreToken, cfg.ShowCursor, &preparation.streamSize)
+	nodeID, pwFd, portal, restoreToken, err := requestScreencastSession(ctx, cfg.RestoreToken, cfg.ShowCursor, &preparation.streamSize, !cfg.PortalOnly)
 	if err != nil {
 		return nil, fmt.Errorf("screencast portal: %w", err)
 	}
@@ -292,6 +291,28 @@ func PrepareCapture(ctx context.Context, cfg CaptureConfig) (*CapturePreparation
 	preparation.pwFd = pwFd
 	preparation.portal = portal
 	return preparation, nil
+}
+
+func captureKind(cfg CaptureConfig) (capturePreparationKind, error) {
+	if cfg.PortalOnly {
+		if cfg.X11WindowID != 0 || cfg.X11WindowName != "" {
+			return 0, fmt.Errorf("portal-only capture does not allow X11 window selection")
+		}
+		if os.Getenv("XDG_SESSION_TYPE") != "wayland" {
+			return 0, fmt.Errorf("portal-only capture requires a Wayland session")
+		}
+		return capturePreparationWayland, nil
+	}
+	if (cfg.X11WindowID != 0 || cfg.X11WindowName != "") && os.Getenv("DISPLAY") != "" {
+		return capturePreparationX11, nil
+	}
+	if os.Getenv("WAYLAND_DISPLAY") != "" {
+		return capturePreparationWayland, nil
+	}
+	if os.Getenv("DISPLAY") != "" {
+		return capturePreparationX11, nil
+	}
+	return 0, fmt.Errorf("no display server detected (neither WAYLAND_DISPLAY nor DISPLAY is set)")
 }
 
 // PrepareTestCapture validates a synthetic capture without starting its
@@ -2157,16 +2178,19 @@ func startPreparedTestCapture(ctx context.Context, cfg CaptureConfig, encoder en
 		fps = 30
 	}
 
-	// pattern=18 = ball (bouncing ball with motion); timeoverlay adds a frame counter.
+	// pattern=18 = ball (bouncing ball with motion). The optional timestamp
+	// overlay must not prevent synthetic capture on a minimal GStreamer install.
 	// Keep test source live/infinite so long-running audio tests do not stop with EOF.
 	source := gstStage{
 		"videotestsrc", "pattern=18", "is-live=true", "do-timestamp=true",
 	}
 	beforeConvert := []gstStage{
 		{fmt.Sprintf("video/x-raw,width=%d,height=%d,framerate=%d/1", testCaptureWidth, testCaptureHeight, fps)},
-		{"timeoverlay"},
-		lowLatencyVideoQueueStage(),
 	}
+	if hasGstElement("timeoverlay") {
+		beforeConvert = append(beforeConvert, gstStage{"timeoverlay"})
+	}
+	beforeConvert = append(beforeConvert, lowLatencyVideoQueueStage())
 	// Match the production capture paths: if conversion/encoding cannot keep up,
 	// keep the newest source frame instead of measuring or streaming a growing
 	// raw backlog.
@@ -2437,6 +2461,10 @@ func normalizeContext(ctx context.Context) context.Context {
 // the retained portal session (which must stay open for capture and retries), and a
 // fresh restore token when the portal grants persistence.
 func requestScreencast(ctx context.Context, restoreToken string, showCursor bool, dimensions *[2]int) (uint32, *os.File, pipeWirePortalSession, string, error) {
+	return requestScreencastSession(ctx, restoreToken, showCursor, dimensions, true)
+}
+
+func requestScreencastSession(ctx context.Context, restoreToken string, showCursor bool, dimensions *[2]int, persist bool) (uint32, *os.File, pipeWirePortalSession, string, error) {
 	ctx = normalizeContext(ctx)
 	conn, err := dbus.ConnectSessionBus()
 	if err != nil {
@@ -2522,13 +2550,7 @@ func requestScreencast(ctx context.Context, restoreToken string, showCursor bool
 		"multiple":     dbus.MakeVariant(false),
 		"cursor_mode":  dbus.MakeVariant(cursorMode),
 	}
-	if portalVersion >= 4 {
-		selectOpts["persist_mode"] = dbus.MakeVariant(uint32(2))
-		if restoreToken != "" {
-			selectOpts["restore_token"] = dbus.MakeVariant(restoreToken)
-			dbg("[CAPTURE] requesting screencast restore with saved token")
-		}
-	}
+	setPortalPersistence(selectOpts, portalVersion, restoreToken, persist)
 
 	selectCtx, cancelSelect := context.WithTimeout(ctx, portalControlPhaseTimeout)
 	_, err = performPortalRequest(selectCtx, conn, selectPath, portalMethodTimeout,
@@ -2579,7 +2601,7 @@ func requestScreencast(ctx context.Context, restoreToken string, showCursor bool
 	}
 
 	newRestoreToken := ""
-	if variant, ok := startResult["restore_token"]; ok {
+	if variant, ok := startResult["restore_token"]; ok && persist {
 		value, ok := variant.Value().(string)
 		if !ok {
 			return 0, nil, nil, "", fmt.Errorf("unexpected restore token type: %T", variant.Value())
@@ -2647,6 +2669,20 @@ func requestScreencast(ctx context.Context, restoreToken string, showCursor bool
 
 	sessionTransferred = true
 	return nodeID, pwFile, portalSession, newRestoreToken, nil
+}
+
+func setPortalPersistence(options map[string]dbus.Variant, version uint32, token string, persist bool) {
+	if version < 4 {
+		return
+	}
+	mode := uint32(0)
+	if persist {
+		mode = 2
+	}
+	options["persist_mode"] = dbus.MakeVariant(mode)
+	if persist && token != "" {
+		options["restore_token"] = dbus.MakeVariant(token)
+	}
 }
 
 func portalStreamDimensions(properties map[string]dbus.Variant) (int, int, bool) {

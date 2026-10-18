@@ -2,12 +2,16 @@ package airplay
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"net"
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/crypto/chacha20poly1305"
 )
 
 // TestRTSPRequestAnswersDigestChallenge drives rtspRequest against a fake
@@ -45,6 +49,7 @@ func TestRTSPRequestAnswersDigestChallenge(t *testing.T) {
 			return
 		}
 		defer conn.Close()
+		conn = authenticatedTransportTestServer(conn)
 
 		var seen []rtspTestRequest
 		reader := bufio.NewReader(conn)
@@ -89,6 +94,7 @@ func TestRTSPRequestAnswersDigestChallenge(t *testing.T) {
 		t.Fatalf("connect: %v", err)
 	}
 	defer client.Close()
+	authenticateTransportTestClient(t, client)
 
 	body, _, err := client.rtspRequest("SETUP", uri, "text/plain", []byte("x"), nil)
 	if err != nil {
@@ -113,6 +119,59 @@ func TestRTSPRequestAnswersDigestChallenge(t *testing.T) {
 	}
 }
 
+// Transport tests start after successful pairing. Their fixed keys exercise
+// real HAP framing; security_auth_test.go covers authenticating and pinning them.
+func authenticateTransportTestClient(t *testing.T, client *AirPlayClient) {
+	t.Helper()
+	client.PairKeys = &PairKeys{
+		ReceiverID:     "transport-test-receiver",
+		ReceiverPublic: bytes.Repeat([]byte{0x41}, ed25519.PublicKeySize),
+		SharedSecret:   transportTestSecret(),
+	}
+	client.pairingProtocol = pairingProtocolHAP
+	client.encrypted = true
+	client.encWriteKey = bytes.Repeat([]byte{0x42}, chacha20poly1305.KeySize)
+	client.encReadKey = bytes.Repeat([]byte{0x43}, chacha20poly1305.KeySize)
+	var err error
+	client.encCipher, err = chacha20poly1305.New(client.encWriteKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func transportTestSecret() []byte { return bytes.Repeat([]byte{0x44}, 32) }
+
+type authenticatedTransportTestConn struct {
+	net.Conn
+	stream *receiverHAPStream
+}
+
+func (c *authenticatedTransportTestConn) Read(data []byte) (int, error) {
+	return c.stream.Read(data)
+}
+
+func (c *authenticatedTransportTestConn) Write(data []byte) (int, error) {
+	return c.stream.Write(data)
+}
+
+func authenticatedTransportTestServer(conn net.Conn) net.Conn {
+	stream, err := newReceiverHAPStream(conn, bytes.Repeat([]byte{0x42}, 32), bytes.Repeat([]byte{0x43}, 32))
+	if err != nil {
+		panic(err)
+	}
+	return &authenticatedTransportTestConn{Conn: conn, stream: stream}
+}
+
+func authenticatedTransportTestEvents(conn net.Conn) net.Conn {
+	readKey := hkdfSHA512(transportTestSecret(), []byte("Events-Salt"), []byte("Events-Read-Encryption-Key"), 32)
+	writeKey := hkdfSHA512(transportTestSecret(), []byte("Events-Salt"), []byte("Events-Write-Encryption-Key"), 32)
+	stream, err := newReceiverHAPStream(conn, readKey, writeKey)
+	if err != nil {
+		panic(err)
+	}
+	return &authenticatedTransportTestConn{Conn: conn, stream: stream}
+}
+
 // TestRTSPRequestWithoutPasswordDoesNotRetry checks that an unconfigured
 // password leaves the 401 to surface rather than retrying blindly.
 func TestRTSPRequestWithoutPasswordDoesNotRetry(t *testing.T) {
@@ -131,6 +190,7 @@ func TestRTSPRequestWithoutPasswordDoesNotRetry(t *testing.T) {
 			return
 		}
 		defer conn.Close()
+		conn = authenticatedTransportTestServer(conn)
 
 		reader := bufio.NewReader(conn)
 		n := 0
@@ -157,6 +217,7 @@ func TestRTSPRequestWithoutPasswordDoesNotRetry(t *testing.T) {
 		t.Fatalf("connect: %v", err)
 	}
 
+	authenticateTransportTestClient(t, client)
 	if _, _, err := client.rtspRequest("SETUP", "rtsp://127.0.0.1/stream", "text/plain", []byte("x"), nil); !errors.Is(err, ErrCredentialsRequired) {
 		t.Fatalf("error = %v, want ErrCredentialsRequired", err)
 	} else {
@@ -203,6 +264,7 @@ func TestCachedChallengeAuthenticatesLaterRequests(t *testing.T) {
 			return
 		}
 		defer conn.Close()
+		conn = authenticatedTransportTestServer(conn)
 
 		var seen []rtspTestRequest
 		reader := bufio.NewReader(conn)
@@ -243,6 +305,7 @@ func TestCachedChallengeAuthenticatesLaterRequests(t *testing.T) {
 	}
 
 	// First request on the connection: challenged, then retried with credentials.
+	authenticateTransportTestClient(t, client)
 	if _, _, err := client.rtspRequest("SETUP", setupURI, "text/plain", []byte("x"), nil); err != nil {
 		t.Fatalf("SETUP: %v", err)
 	}

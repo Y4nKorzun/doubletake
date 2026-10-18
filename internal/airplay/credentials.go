@@ -4,9 +4,11 @@ import (
 	"crypto/ed25519"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 )
 
 // SavedCredentials holds the persistent pairing credentials and optional
@@ -119,14 +121,27 @@ func NewCredentialStoreWithBackend(b CredentialBackend) *CredentialStore {
 }
 
 // Lookup returns saved credentials for a device, or nil if not found.
+// Deprecated: use LookupEntry so a backend error cannot trigger new pairing.
 func (cs *CredentialStore) Lookup(deviceID string) *SavedCredentials {
+	creds, _ := cs.LookupEntry(deviceID)
+	return creds
+}
+
+// LookupEntry distinguishes an unpaired receiver from an unavailable or corrupt
+// credential backend. Connection decisions must not discard its error.
+func (cs *CredentialStore) LookupEntry(deviceID string) (*SavedCredentials, error) {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 	creds, err := cs.backend.Lookup(deviceID)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("look up saved receiver identity: %w", err)
 	}
-	return creds
+	if creds != nil && !creds.HasPairingCredentials() &&
+		(creds.PairingID != "" || len(creds.Ed25519Public) != 0 || len(creds.Ed25519Seed) != 0 ||
+			creds.ReceiverID != "" || len(creds.ReceiverPublic) != 0 || creds.PairingProtocol != PairingProtocolUnknown) {
+		return nil, fmt.Errorf("saved receiver identity is incomplete; verify the receiver before explicitly pairing again")
+	}
+	return creds, nil
 }
 
 // Len returns the number of stored credential entries.
@@ -221,21 +236,67 @@ func newFileBackend(path string) (*fileBackend, error) {
 		path:    path,
 		devices: make(map[string]*SavedCredentials),
 	}
-	data, err := os.ReadFile(path)
+	if err := validateCredentialDirectory(filepath.Dir(path)); err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+	metadata, err := os.Lstat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return fb, nil
 		}
 		return nil, fmt.Errorf("read credential store: %w", err)
 	}
+	if !metadata.Mode().IsRegular() || metadata.Mode().Perm()&0077 != 0 || !credentialOwnedByUser(metadata) {
+		return nil, fmt.Errorf("credential store must be a private, user-owned regular file (mode 0600)")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open credential store: %w", err)
+	}
+	defer file.Close()
+	opened, err := file.Stat()
+	if err != nil || !os.SameFile(metadata, opened) {
+		return nil, fmt.Errorf("credential store changed while opening")
+	}
+	const maxCredentialBytes = 1 << 20
+	data, err := io.ReadAll(io.LimitReader(file, maxCredentialBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read credential store: %w", err)
+	}
+	if len(data) > maxCredentialBytes {
+		return nil, fmt.Errorf("credential store exceeds size limit")
+	}
 	if err := json.Unmarshal(data, &fb.devices); err != nil {
 		return nil, fmt.Errorf("unmarshal credential store: %w", err)
+	}
+	if fb.devices == nil {
+		return nil, fmt.Errorf("credential store must be an object")
 	}
 	return fb, nil
 }
 
+func validateCredentialDirectory(path string) error {
+	metadata, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if !metadata.IsDir() || metadata.Mode().Perm()&0022 != 0 || !credentialOwnedByUser(metadata) {
+		return fmt.Errorf("credential directory must be owned by the current user and not writable by other users")
+	}
+	return nil
+}
+
+func credentialOwnedByUser(metadata os.FileInfo) bool {
+	stat, ok := metadata.Sys().(*syscall.Stat_t)
+	return ok && stat.Uid == uint32(os.Getuid())
+}
+
 func (fb *fileBackend) Lookup(deviceID string) (*SavedCredentials, error) {
-	return fb.devices[deviceID], nil
+	creds, exists := fb.devices[deviceID]
+	if exists && creds == nil {
+		return nil, fmt.Errorf("saved receiver entry is null")
+	}
+	return creds, nil
 }
 
 func (fb *fileBackend) Save(deviceID string, creds *SavedCredentials) error {
@@ -247,6 +308,9 @@ func (fb *fileBackend) persist() error {
 	dir := filepath.Dir(fb.path)
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return fmt.Errorf("create credential dir: %w", err)
+	}
+	if err := validateCredentialDirectory(dir); err != nil {
+		return err
 	}
 	data, err := json.MarshalIndent(fb.devices, "", "  ")
 	if err != nil {

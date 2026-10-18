@@ -364,7 +364,7 @@ func (c *AirPlayClient) requestSetup(uri, phase string, request map[string]inter
 		return nil, nil, receivedAt, false, !hasIncompleteResponse(err), fmt.Errorf("%s SETUP: %w", phase, err)
 	}
 	var response map[string]interface{}
-	if _, err := plist.Unmarshal(responseBody, &response); err != nil {
+	if _, err := unmarshalNetworkPlist(responseBody, &response); err != nil {
 		// The receiver accepted this SETUP even though its response body was not
 		// usable. The caller must still release the session it just created.
 		return nil, headers, receivedAt, true, true, fmt.Errorf("unmarshal %s SETUP response: %w", phase, err)
@@ -567,7 +567,11 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 	// NTP sessions establish their mapping by probing this port during SETUP.
 	// PTP sessions instead use the receiver's advertised network clock.
 	if timingProtocol == timingProtocolNTP {
-		go ntpTimingResponder(sessionCtx, timingConn)
+		var receiverIP net.IP
+		if peer, ok := c.conn.RemoteAddr().(*net.TCPAddr); ok {
+			receiverIP = append(net.IP(nil), peer.IP...)
+		}
+		go ntpTimingResponder(sessionCtx, timingConn, receiverIP)
 	}
 
 	// Select the same low/normal/high screen profiles from the control route's
@@ -2262,7 +2266,7 @@ func (s *MirrorSession) feedbackLoop(ctx context.Context) {
 			return
 		}
 		var fbResp map[string]interface{}
-		if _, err := plist.Unmarshal(body, &fbResp); err == nil {
+		if _, err := unmarshalNetworkPlist(body, &fbResp); err == nil {
 			debugDumpPlist("feedback response", fbResp)
 		} else {
 			dbg("[FEEDBACK] response: %d bytes", len(body))
@@ -2435,7 +2439,7 @@ func (s *MirrorSession) AudioStream() *AudioStream {
 }
 
 // ntpTimingResponder replies to NTP timing requests from the Apple TV.
-func ntpTimingResponder(ctx context.Context, conn net.PacketConn) {
+func ntpTimingResponder(ctx context.Context, conn net.PacketConn, receiverIP net.IP) {
 	buf := make([]byte, 128)
 	for {
 		select {
@@ -2452,6 +2456,10 @@ func ntpTimingResponder(ctx context.Context, conn net.PacketConn) {
 			}
 			dbg("[NTP] read error: %v", err)
 			return
+		}
+		peer, ok := addr.(*net.UDPAddr)
+		if !ok || len(receiverIP) == 0 || !peer.IP.Equal(receiverIP) {
+			continue
 		}
 		dbg("[NTP] received %d bytes from %s: %02x", n, addr, buf[:min(n, 32)])
 

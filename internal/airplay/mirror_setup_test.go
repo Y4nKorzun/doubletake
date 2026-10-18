@@ -202,6 +202,7 @@ func TestSetupMirrorDigestRetryReusesStartedVideoPreparation(t *testing.T) {
 			return
 		}
 		defer conn.Close()
+		conn = authenticatedTransportTestServer(conn)
 		reader := bufio.NewReader(conn)
 
 		for attempt := 0; attempt < 2; attempt++ {
@@ -276,6 +277,7 @@ func TestSetupMirrorDigestRetryReusesStartedVideoPreparation(t *testing.T) {
 		t.Fatalf("connect: %v", err)
 	}
 	defer client.Close()
+	authenticateTransportTestClient(t, client)
 	client.info = &ReceiverInfo{SupportedFormats: StreamFormats{ScreenStream: 0x800000}}
 
 	callbackCalls := 0
@@ -350,6 +352,7 @@ func TestSetupMirrorTearsDownAcceptedControlWhenVideoPreparationFails(t *testing
 			return
 		}
 		defer conn.Close()
+		conn = authenticatedTransportTestServer(conn)
 		reader := bufio.NewReader(conn)
 
 		control, err := readRTSPTestRequest(reader)
@@ -391,6 +394,7 @@ func TestSetupMirrorTearsDownAcceptedControlWhenVideoPreparationFails(t *testing
 		t.Fatalf("connect: %v", err)
 	}
 	defer client.Close()
+	authenticateTransportTestClient(t, client)
 	client.info = &ReceiverInfo{SupportedFormats: StreamFormats{ScreenStream: 0x800000}}
 
 	prepareErr := errors.New("production capture did not start")
@@ -420,6 +424,7 @@ func TestSetupMirrorTearsDownAcceptedLegacyAudioOnResponseFailure(t *testing.T) 
 			return
 		}
 		defer conn.Close()
+		conn = authenticatedTransportTestServer(conn)
 		reader := bufio.NewReader(conn)
 
 		control, err := readRTSPTestRequest(reader)
@@ -467,6 +472,7 @@ func TestSetupMirrorTearsDownAcceptedLegacyAudioOnResponseFailure(t *testing.T) 
 		t.Fatalf("connect: %v", err)
 	}
 	defer client.Close()
+	authenticateTransportTestClient(t, client)
 	client.info = &ReceiverInfo{SupportedFormats: StreamFormats{ScreenStream: 0x800000}}
 
 	_, setupErr := client.SetupMirror(ctx, StreamConfig{NoAudio: true})
@@ -493,6 +499,7 @@ func TestSetupMirrorDoesNotTeardownRejectedControl(t *testing.T) {
 			return
 		}
 		defer conn.Close()
+		conn = authenticatedTransportTestServer(conn)
 		reader := bufio.NewReader(conn)
 		request, err := readRTSPTestRequest(reader)
 		if err != nil {
@@ -525,6 +532,7 @@ func TestSetupMirrorDoesNotTeardownRejectedControl(t *testing.T) {
 	if err := client.Connect(ctx); err != nil {
 		t.Fatalf("connect: %v", err)
 	}
+	authenticateTransportTestClient(t, client)
 	client.info = &ReceiverInfo{SupportedFormats: StreamFormats{ScreenStream: 0x800000}}
 
 	_, setupErr := client.SetupMirror(ctx, StreamConfig{NoAudio: true})
@@ -559,6 +567,7 @@ func TestSetupMirrorClosesTimedOutSequentialConnectionWithoutTeardown(t *testing
 			return
 		}
 		defer conn.Close()
+		conn = authenticatedTransportTestServer(conn)
 		reader := bufio.NewReader(conn)
 		control, err := readRTSPTestRequest(reader)
 		if err != nil {
@@ -603,6 +612,7 @@ func TestSetupMirrorClosesTimedOutSequentialConnectionWithoutTeardown(t *testing
 		t.Fatalf("connect: %v", err)
 	}
 	defer client.Close()
+	authenticateTransportTestClient(t, client)
 	client.info = &ReceiverInfo{SupportedFormats: StreamFormats{ScreenStream: 0x800000}}
 
 	prepareCalls := 0
@@ -683,6 +693,7 @@ func testMirrorSessionInfoFailure(t *testing.T, infoResponse []byte, wantTeardow
 			return
 		}
 		defer conn.Close()
+		conn = authenticatedTransportTestServer(conn)
 		reader := bufio.NewReader(conn)
 		control, err := readRTSPTestRequest(reader)
 		if err != nil {
@@ -744,6 +755,7 @@ func testMirrorSessionInfoFailure(t *testing.T, infoResponse []byte, wantTeardow
 		t.Fatalf("connect: %v", err)
 	}
 	defer client.Close()
+	authenticateTransportTestClient(t, client)
 	client.info = &ReceiverInfo{SupportedFormats: StreamFormats{ScreenStream: 0x800000}}
 
 	prepareCalls := 0
@@ -790,7 +802,7 @@ func TestRequestSetupDigestResultClassification(t *testing.T) {
 			name:           "authenticated partial response",
 			password:       "secret",
 			secondResponse: "partial",
-			wantError:      "read body",
+			wantError:      "read encrypted body",
 		},
 		{
 			name:           "authenticated malformed plist",
@@ -804,6 +816,8 @@ func TestRequestSetupDigestResultClassification(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			clientConn, serverConn := net.Pipe()
 			client := &AirPlayClient{conn: clientConn, authPassword: test.password}
+			authenticateTransportTestClient(t, client)
+			serverConn = authenticatedTransportTestServer(serverConn)
 			serverErr := make(chan error, 1)
 			go func() {
 				defer serverConn.Close()
@@ -910,6 +924,8 @@ func TestFailedMirrorSetupTeardownClosesOnRejectedCleanup(t *testing.T) {
 	clientConn, serverConn := net.Pipe()
 	defer serverConn.Close()
 	client := &AirPlayClient{conn: clientConn}
+	authenticateTransportTestClient(t, client)
+	serverConn = authenticatedTransportTestServer(serverConn)
 	serverErr := make(chan error, 1)
 	go func() {
 		request, err := readRTSPTestRequest(bufio.NewReader(serverConn))
@@ -1078,6 +1094,7 @@ func testSetupMirrorAudioSessionNegotiation(t *testing.T, test audioSessionCase)
 			return
 		}
 		defer conn.Close()
+		conn = authenticatedTransportTestEvents(conn)
 		body, err := plist.Marshal(map[string]interface{}{
 			"type": "forceKeyFrame",
 		}, plist.BinaryFormat)
@@ -1137,6 +1154,7 @@ func testSetupMirrorAudioSessionNegotiation(t *testing.T, test audioSessionCase)
 			return
 		}
 		defer conn.Close()
+		conn = authenticatedTransportTestServer(conn)
 
 		reader := bufio.NewReader(conn)
 		timingPort := 0
@@ -1244,8 +1262,8 @@ func testSetupMirrorAudioSessionNegotiation(t *testing.T, test audioSessionCase)
 							return
 						}
 					} else {
-						if got, _ := setup["sourceVersion"].(string); got != legacyAirPlaySourceVersion {
-							serverErr <- fmt.Errorf("audio sourceVersion = %q, want %q", got, legacyAirPlaySourceVersion)
+						if got, _ := setup["sourceVersion"].(string); got != modernAirPlaySourceVersion {
+							serverErr <- fmt.Errorf("audio sourceVersion = %q, want %q", got, modernAirPlaySourceVersion)
 							return
 						}
 						if got, _ := setup["timingProtocol"].(string); got != timingProtocolNTP {
@@ -1382,6 +1400,7 @@ func testSetupMirrorAudioSessionNegotiation(t *testing.T, test audioSessionCase)
 		t.Fatalf("connect: %v", err)
 	}
 	defer client.Close()
+	authenticateTransportTestClient(t, client)
 	// -no-audio is also the escape hatch for receivers that advertise no screen
 	// audio codec we can encode. Timing and video setup must remain usable.
 	screenStreamFormats := FormatMask(0x40000) // ALAC

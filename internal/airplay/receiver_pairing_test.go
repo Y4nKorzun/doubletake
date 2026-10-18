@@ -100,6 +100,8 @@ func TestReceiverPairingStateSavedHAPVerify(t *testing.T) {
 		PairKeys: &PairKeys{
 			Ed25519Public:  append(ed25519.PublicKey(nil), client.PairKeys.Ed25519Public...),
 			Ed25519Private: append(ed25519.PrivateKey(nil), client.PairKeys.Ed25519Private...),
+			ReceiverID:     client.PairKeys.ReceiverID,
+			ReceiverPublic: append(ed25519.PublicKey(nil), client.PairKeys.ReceiverPublic...),
 		},
 	}
 	secondState := newReceiverPairingTestState(t, "4827", store)
@@ -132,6 +134,8 @@ func TestReceiverPairingStateRawSetupAndVerify(t *testing.T) {
 		t.Fatalf("raw pair setup: %v", err)
 	}
 	client.info.PK = serverPublic
+	client.PairKeys.ReceiverID = state.identifier
+	client.PairKeys.ReceiverPublic = append(ed25519.PublicKey(nil), state.publicKey...)
 	if err := client.rawPairVerify(ctx); err != nil {
 		t.Fatalf("raw pair verify: %v", err)
 	}
@@ -166,6 +170,8 @@ func TestReceiverPairingStateSavedRawVerify(t *testing.T) {
 		t.Fatalf("raw pair setup: %v", err)
 	}
 	client.info.PK = serverPublic
+	client.PairKeys.ReceiverID = state.identifier
+	client.PairKeys.ReceiverPublic = append(ed25519.PublicKey(nil), state.publicKey...)
 	if err := client.rawPairVerify(ctx); err != nil {
 		closeFirst()
 		t.Fatalf("initial raw pair verify: %v", err)
@@ -184,20 +190,11 @@ func TestReceiverPairingStateSavedRawVerify(t *testing.T) {
 	}
 	savedClient := NewAirPlayClient("127.0.0.1", 7000)
 	savedClient.info = &ReceiverInfo{PK: append(plistData(nil), serverPublic...)}
-	if err := savedClient.RestorePairingCredentials(saved); err != nil {
-		t.Fatalf("restore raw credentials: %v", err)
+	if err := savedClient.RestorePairingCredentials(saved); err == nil {
+		t.Fatal("restored raw credentials without a verified receiver identity")
 	}
-	secondConn, secondDone, closeSecond := runReceiverPairingServer(t, state, 0, 2)
-	defer closeSecond()
-	savedClient.conn = secondConn
-	if err := savedClient.PairVerify(ctx); err != nil {
-		t.Fatalf("saved raw pair verify: %v", err)
-	}
-	if err := <-secondDone; err != nil {
-		t.Fatalf("saved raw receiver: %v", err)
-	}
-	if keys, ok := state.sessionKeys(); !ok || keys.encrypted {
-		t.Fatal("saved raw verification did not establish a plaintext session")
+	if savedClient.PairKeys != nil {
+		t.Fatal("rejected raw credentials partially installed pairing keys")
 	}
 }
 
@@ -239,7 +236,7 @@ func TestReceiverPairingStateRejectsWrongSRPProof(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	err := client.pairSetup(ctx, "0000")
-	if err == nil || !bytes.Contains([]byte(err.Error()), []byte("M4 error")) {
+	if err == nil || !bytes.Contains([]byte(err.Error()), []byte("M4:")) {
 		t.Fatalf("wrong-PIN error = %v, want M4 authentication error", err)
 	}
 	if err := <-serverDone; err != nil {

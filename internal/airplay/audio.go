@@ -174,17 +174,16 @@ func pulseMonitorSourceArgs(monitor string, codec AudioCodec) []string {
 	}
 }
 
-func selectAudioMonitorSource(hasPulse bool, monitor string, hasPipeWire bool, codec AudioCodec) ([]string, string) {
+func selectAudioMonitorSource(hasPulse bool, monitor string, codec AudioCodec) ([]string, string) {
 	// Pulse-on-PipeWire keeps a hardware monitor active while its sink is
 	// suspended. That gives the sender silent frames immediately and lets later
 	// playback enter the same stream. A pipewiresrc attached directly to the
 	// suspended sink can remain idle permanently.
-	if hasPulse && monitor != "" {
+	if hasPulse && strings.HasSuffix(monitor, ".monitor") {
 		return pulseMonitorSourceArgs(monitor, codec), "pulse"
 	}
-	if hasPipeWire {
-		return []string{"pipewiresrc", "client-name=doubletake"}, "pipewire"
-	}
+	// An untargeted audio source can resolve to the microphone. Screen mirroring
+	// may capture only the explicitly selected output monitor.
 	return nil, ""
 }
 
@@ -258,24 +257,21 @@ func StartAudioCapture(ctx context.Context, testTone bool, codec AudioCodec) (*A
 			fmt.Sprintf("samplesperbuffer=%d", codecSPF)}
 		dbg("[AUDIO] using test tone (440 Hz sine wave, live, spf=%d)", codecSPF)
 	} else {
-		hasPipeWireSource := exec.Command("gst-inspect-1.0", "pipewiresrc").Run() == nil
 		hasPulseSource := exec.Command("gst-inspect-1.0", "pulsesrc").Run() == nil
 		monitor := ""
 		if hasPulseSource {
 			monitor = detectPulseMonitor()
 		}
 		var source string
-		srcArgs, source = selectAudioMonitorSource(hasPulseSource, monitor, hasPipeWireSource, codec)
+		srcArgs, source = selectAudioMonitorSource(hasPulseSource, monitor, codec)
 		switch source {
 		case "pulse":
 			fragmentTime := audioCaptureFragmentTime(codec)
 			dbg("[AUDIO] using pulsesrc device=%s (buffer=%s fragment=%s)",
 				monitor, audioCaptureStallBuffer, fragmentTime)
-		case "pipewire":
-			dbg("[AUDIO] using default pipewiresrc")
 		default:
 			cancel()
-			return nil, fmt.Errorf("no audio source available (need pulsesrc or pipewiresrc)")
+			return nil, fmt.Errorf("system audio requires pulsesrc and an explicit output monitor; microphone fallback is disabled")
 		}
 	}
 
@@ -701,6 +697,19 @@ func (s *MirrorSession) AudioCodec() AudioCodec {
 //   - ctrlConn: the declared controlPort socket → sends sync/control to receiver's controlPort
 //   - dataConn: a separate socket at controlPort+1 → sends audio data to receiver's dataPort
 func (s *MirrorSession) setupAudioStream(dataPort, controlPort int, aesKey, aesIV, chachaKey []byte, securityMode audioSecurityMode, ct byte, latencyOverride uint32, rfc2198 bool, ctrlConn, dataConn net.PacketConn) (*AudioStream, error) {
+	switch securityMode {
+	case audioSecurityLegacyAES:
+		if len(aesKey) != aes.BlockSize || len(aesIV) != aes.BlockSize {
+			return nil, fmt.Errorf("AES audio requires a complete encryption key and IV")
+		}
+	case audioSecurityChaCha:
+		if len(chachaKey) != 32 {
+			return nil, fmt.Errorf("ChaCha20-Poly1305 audio requires a complete encryption key")
+		}
+	default:
+		return nil, fmt.Errorf("unsupported audio encryption mode %d", securityMode)
+	}
+
 	remoteAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(s.client.host, fmt.Sprintf("%d", dataPort)))
 	if err != nil {
 		return nil, fmt.Errorf("resolve audio remote: %w", err)
@@ -1006,30 +1015,6 @@ func (as *AudioStream) buildAudioPacketWithClearPrefixLocked(payload []byte, cle
 		packetPayload = make([]byte, len(clearPayload)+len(encrypted))
 		copy(packetPayload, clearPayload)
 		copy(packetPayload[len(clearPayload):], encrypted)
-
-		// Self-decrypt check on first packet to verify key/IV correctness
-		if seq == 1 {
-			blockSize := as.cipher.BlockSize()
-			encryptedPayload := packetPayload[len(clearPayload):]
-			encLen := (len(encryptedPayload) / blockSize) * blockSize
-			if encLen > 0 {
-				decrypted := append([]byte(nil), encryptedPayload...)
-				dec := cipher.NewCBCDecrypter(as.cipher, as.aesIV)
-				dec.CryptBlocks(decrypted[:encLen], decrypted[:encLen])
-				match := true
-				for i := 0; i < len(protectedPayload); i++ {
-					if decrypted[i] != protectedPayload[i] {
-						match = false
-						break
-					}
-				}
-				dbg("[AUDIO] *** SELF-DECRYPT CHECK: match=%v", match)
-				dbg("[AUDIO] *** plaintext first 16: %02x", protectedPayload[:min(16, len(protectedPayload))])
-				dbg("[AUDIO] *** encrypted first 16: %02x", encryptedPayload[:min(16, len(encryptedPayload))])
-				dbg("[AUDIO] *** decrypted first 16: %02x", decrypted[:min(16, len(decrypted))])
-				dbg("[AUDIO] *** IV: %02x", as.aesIV)
-			}
-		}
 	}
 
 	packet := make([]byte, 12+len(packetPayload))
@@ -1142,7 +1127,7 @@ func (as *AudioStream) handleAudioControlPacket(packet []byte, addr net.Addr) (h
 
 func (as *AudioStream) audioControlPacketFromReceiver(addr net.Addr) bool {
 	if as.ctrlAddr == nil || len(as.ctrlAddr.IP) == 0 {
-		return true
+		return false
 	}
 	peer, ok := addr.(*net.UDPAddr)
 	return ok && peer.IP.Equal(as.ctrlAddr.IP)

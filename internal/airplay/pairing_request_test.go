@@ -2,9 +2,7 @@ package airplay
 
 import (
 	"bufio"
-	"bytes"
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
@@ -341,109 +339,42 @@ func TestRequiredPairingCredential(t *testing.T) {
 	}
 }
 
-func TestModernPasswordAndPINFlagsStillStartTransientPairing(t *testing.T) {
+func TestModernPasswordAndPINFlagsRequireAuthenticatedPairing(t *testing.T) {
 	clientConn, serverConn := net.Pipe()
 	defer clientConn.Close()
-
-	deadline := time.Now().Add(5 * time.Second)
-	if err := clientConn.SetDeadline(deadline); err != nil {
+	defer serverConn.Close()
+	client := &AirPlayClient{conn: clientConn, info: &ReceiverInfo{Features: FeatureSystemPairing | FeatureTransientPairing | uint64(1<<38) | uint64(1<<46), StatusFlags: statusFlagPasswordRequired | statusFlagPINRequiredForPairing}}
+	if err := client.Pair(context.Background(), ""); !errors.Is(err, ErrPINRequired) {
+		t.Fatalf("Pair without a PIN = %v, want ErrPINRequired", err)
+	}
+	if client.PairKeys != nil {
+		t.Fatal("refused pairing generated transient keys")
+	}
+	if err := serverConn.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
 		t.Fatal(err)
 	}
-	if err := serverConn.SetDeadline(deadline); err != nil {
-		t.Fatal(err)
+	if n, err := serverConn.Read(make([]byte, 1)); n != 0 || err == nil {
+		t.Fatal("refused pairing sent a protocol request")
 	}
-
-	client := &AirPlayClient{
-		conn: clientConn,
-		info: &ReceiverInfo{
-			Features:    FeatureSystemPairing | FeatureTransientPairing | uint64(1<<38) | uint64(1<<46),
-			StatusFlags: statusFlagPasswordRequired | statusFlagPINRequiredForPairing,
-		},
-	}
-
-	serverDone := make(chan error, 1)
-	go func() {
-		defer serverConn.Close()
-		request, err := readRTSPTestRequest(bufio.NewReader(serverConn))
-		if err != nil {
-			serverDone <- err
-			return
-		}
-		if request.method != "POST" || request.uri != "/pair-setup" {
-			serverDone <- fmt.Errorf("request = %s %s, want POST /pair-setup", request.method, request.uri)
-			return
-		}
-		if got := request.headers["x-apple-hkp"]; got != "4" {
-			serverDone <- fmt.Errorf("X-Apple-HKP = %q, want transient type 4", got)
-			return
-		}
-		message := tlv8Decode(request.body)
-		if !bytes.Equal(message[tlvState], []byte{1}) ||
-			!bytes.Equal(message[tlvMethod], []byte{0}) ||
-			len(message[tlvFlags]) != 4 ||
-			binary.LittleEndian.Uint32(message[tlvFlags]) != pairingFlagTransient {
-			serverDone <- fmt.Errorf("pair-setup M1 is not transient: %x", request.body)
-			return
-		}
-		serverDone <- writeRTSPTestResponse(serverConn, 500, nil, nil)
-	}()
-
-	if err := client.Pair(context.Background(), ""); err == nil {
-		t.Fatal("Pair succeeded after the scripted receiver rejected transient setup")
-	} else if errors.Is(err, ErrPINRequired) {
-		t.Fatalf("modern password+PIN flags incorrectly required full PIN pairing: %v", err)
-	}
-	waitPairingTestServer(t, serverDone)
 }
 
-func TestRokuTransientPairingStartsWithRawProtocol(t *testing.T) {
+func TestRokuRefusesRawPairingWithoutPIN(t *testing.T) {
 	clientConn, serverConn := net.Pipe()
 	defer clientConn.Close()
-
-	deadline := time.Now().Add(5 * time.Second)
-	if err := clientConn.SetDeadline(deadline); err != nil {
+	defer serverConn.Close()
+	client := &AirPlayClient{conn: clientConn, info: &ReceiverInfo{Features: 0x38bcf46007f8ad0, StatusFlags: statusFlagPasswordRequired | statusFlagPINRequiredForPairing}}
+	if err := client.Pair(context.Background(), ""); !errors.Is(err, ErrPINRequired) {
+		t.Fatalf("Pair without a PIN = %v, want ErrPINRequired", err)
+	}
+	if client.PairKeys != nil {
+		t.Fatal("refused pairing generated transient keys")
+	}
+	if err := serverConn.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
 		t.Fatal(err)
 	}
-	if err := serverConn.SetDeadline(deadline); err != nil {
-		t.Fatal(err)
+	if n, err := serverConn.Read(make([]byte, 1)); n != 0 || err == nil {
+		t.Fatal("refused pairing sent a protocol request")
 	}
-
-	client := &AirPlayClient{
-		conn: clientConn,
-		info: &ReceiverInfo{
-			Features: 0x38bcf46007f8ad0,
-		},
-	}
-
-	serverDone := make(chan error, 1)
-	go func() {
-		defer serverConn.Close()
-		request, err := readRTSPTestRequest(bufio.NewReader(serverConn))
-		if err != nil {
-			serverDone <- err
-			return
-		}
-		if request.method != "POST" || request.uri != "/pair-setup" {
-			serverDone <- fmt.Errorf("request = %s %s, want POST /pair-setup", request.method, request.uri)
-			return
-		}
-		if len(request.body) != 32 {
-			serverDone <- fmt.Errorf("first pair-setup body = %d bytes, want 32-byte raw public key", len(request.body))
-			return
-		}
-		if got := request.headers["x-apple-hkp"]; got != "" {
-			serverDone <- fmt.Errorf("raw pair-setup X-Apple-HKP = %q, want empty", got)
-			return
-		}
-		serverDone <- writeRTSPTestResponse(serverConn, 500, nil, nil)
-	}()
-
-	if err := client.Pair(context.Background(), ""); err == nil {
-		t.Fatal("Pair succeeded after the scripted receiver rejected raw setup")
-	} else if errors.Is(err, ErrPINRequired) {
-		t.Fatalf("Roku pairing returned ErrPINRequired instead of probing raw setup: %v", err)
-	}
-	waitPairingTestServer(t, serverDone)
 }
 
 func waitPairingTestServer(t *testing.T, done <-chan error) {

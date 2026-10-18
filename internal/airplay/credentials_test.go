@@ -92,7 +92,7 @@ func TestCredentialStorePersistsNegotiatedPairingProtocol(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateKey: %v", err)
 	}
-	if err := store.SavePairing("raw-device", "pair-id", pub, priv, PairingProtocolRaw); err != nil {
+	if err := store.SaveAuthenticatedPairing("raw-device", "pair-id", &PairKeys{Ed25519Public: pub, Ed25519Private: priv, ReceiverID: "trusted-peer", ReceiverPublic: pub}, PairingProtocolRaw); err != nil {
 		t.Fatalf("SavePairing: %v", err)
 	}
 	if err := store.SaveRestoreToken("raw-device", "restore-token"); err != nil {
@@ -123,7 +123,7 @@ func TestCredentialStorePersistsNegotiatedPairingProtocol(t *testing.T) {
 	}
 }
 
-func TestLegacyCredentialEntryInfersProtocolFromCapabilities(t *testing.T) {
+func TestLegacyCredentialEntryRequiresExplicitPairing(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "credentials.json")
 	store, err := NewCredentialStore(path)
 	if err != nil {
@@ -177,11 +177,11 @@ func TestLegacyCredentialEntryInfersProtocolFromCapabilities(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			client := NewAirPlayClient("127.0.0.1", 7000)
 			client.info = test.info
-			if err := client.RestorePairingCredentials(creds); err != nil {
-				t.Fatalf("RestorePairingCredentials: %v", err)
+			if err := client.RestorePairingCredentials(creds); err == nil {
+				t.Fatal("restored old credentials without a verified receiver identity")
 			}
-			if got := client.PairingProtocol(); got != test.protocol {
-				t.Fatalf("restored protocol = %q, want %q", got, test.protocol)
+			if client.PairKeys != nil || client.PairingProtocol() != PairingProtocolUnknown {
+				t.Fatal("rejected old credentials partially installed trusted state")
 			}
 		})
 	}

@@ -43,6 +43,7 @@ func TestExchangePairSetupM1BackoffHonorsContext(t *testing.T) {
 	cancel()
 	_, err := exchangePairSetupM1(ctx, func() ([]byte, error) {
 		return tlv8EncodeOrdered([]tlv8Item{
+			{Tag: tlvState, Value: []byte{2}},
 			{Tag: tlvError, Value: []byte{pairingErrorBackoff}},
 			{Tag: tlvRetryDelay, Value: []byte{1}},
 		}), nil
@@ -56,6 +57,7 @@ func TestExchangePairSetupM1RejectsInvalidBackoff(t *testing.T) {
 	for _, retryDelay := range [][]byte{nil, make([]byte, 9), {31}} {
 		_, err := exchangePairSetupM1(context.Background(), func() ([]byte, error) {
 			return tlv8EncodeOrdered([]tlv8Item{
+				{Tag: tlvState, Value: []byte{2}},
 				{Tag: tlvError, Value: []byte{pairingErrorBackoff}},
 				{Tag: tlvRetryDelay, Value: retryDelay},
 			}), nil
@@ -71,6 +73,7 @@ func TestExchangePairSetupM1BoundsRetries(t *testing.T) {
 	_, err := exchangePairSetupM1(context.Background(), func() ([]byte, error) {
 		calls++
 		return tlv8EncodeOrdered([]tlv8Item{
+			{Tag: tlvState, Value: []byte{2}},
 			{Tag: tlvError, Value: []byte{pairingErrorBackoff}},
 			{Tag: tlvRetryDelay, Value: []byte{0}},
 		}), nil
@@ -95,7 +98,10 @@ func TestPairingRetryDelayLittleEndian(t *testing.T) {
 
 func TestExchangePairSetupM1NamesOtherErrors(t *testing.T) {
 	_, err := exchangePairSetupM1(context.Background(), func() ([]byte, error) {
-		return tlv8EncodeOrdered([]tlv8Item{{Tag: tlvError, Value: []byte{2}}}), nil
+		return tlv8EncodeOrdered([]tlv8Item{
+			{Tag: tlvState, Value: []byte{2}},
+			{Tag: tlvError, Value: []byte{2}},
+		}), nil
 	})
 	if err == nil || !strings.Contains(err.Error(), "authentication (2)") {
 		t.Fatalf("error = %v, want named authentication error", err)

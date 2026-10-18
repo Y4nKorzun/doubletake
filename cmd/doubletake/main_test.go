@@ -93,7 +93,7 @@ func TestPasswordRequiresPairing(t *testing.T) {
 	}{
 		{name: "missing info"},
 		{name: "legacy configured password", info: &airplay.ReceiverInfo{Features: legacyFeatures, StatusFlags: passwordFlag}, want: true},
-		{name: "modern configured password can pair transiently", info: &airplay.ReceiverInfo{Features: modernFeatures, StatusFlags: passwordFlag}},
+		{name: "modern playback password is separate from pairing PIN", info: &airplay.ReceiverInfo{Features: modernFeatures, StatusFlags: passwordFlag}},
 		{name: "modern password suppresses PIN but remains Digest only", info: &airplay.ReceiverInfo{Features: modernFeatures, StatusFlags: passwordFlag | pinFlag}},
 		{name: "legacy password wins over PIN", info: &airplay.ReceiverInfo{Features: legacyFeatures, StatusFlags: passwordFlag | pinFlag}, want: true},
 		{name: "legacy receiver without password", info: &airplay.ReceiverInfo{Features: legacyFeatures}},
@@ -106,38 +106,48 @@ func TestPasswordRequiresPairing(t *testing.T) {
 	}
 }
 
-func TestForcePairDoesNotUseModernDigestPasswordAsSRPPIN(t *testing.T) {
-	const passwordFlag = uint64(1 << 7)
-	modernFeatures := airplay.FeatureSystemPairing | airplay.FeatureTransientPairing | uint64(1<<38) | uint64(1<<46)
-	legacyFeatures := modernFeatures | uint64(1<<51)
-
-	if !forcePairUsesTransient(&airplay.ReceiverInfo{Features: modernFeatures, StatusFlags: passwordFlag}) {
-		t.Fatal("modern fixed-password receiver would reuse its Digest password as an SRP PIN")
-	}
-	if forcePairUsesTransient(&airplay.ReceiverInfo{Features: legacyFeatures, StatusFlags: passwordFlag}) {
-		t.Fatal("legacy fixed-password receiver lost its authenticated SRP pairing path")
-	}
-	if forcePairUsesTransient(&airplay.ReceiverInfo{Features: modernFeatures}) {
-		t.Fatal("unprotected modern receiver unexpectedly bypassed explicit full pairing")
-	}
-}
-
-func TestRestoreSavedPairingRestoresRawProtocol(t *testing.T) {
+func TestRestoreSavedPairingRejectsUnpinnedCredentials(t *testing.T) {
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("GenerateKey: %v", err)
 	}
+	for _, protocol := range []airplay.PairingProtocol{airplay.PairingProtocolRaw, airplay.PairingProtocolHAP} {
+		t.Run(string(protocol), func(t *testing.T) {
+			client := airplay.NewAirPlayClient("127.0.0.1", 7000)
+			err := restoreSavedPairing(client, &airplay.SavedCredentials{
+				PairingID: "pair-id", Ed25519Public: pub, Ed25519Seed: priv.Seed(), PairingProtocol: protocol,
+			})
+			if err == nil || !strings.Contains(err.Error(), "no verified receiver identity") {
+				t.Fatalf("restoreSavedPairing error = %v, want explicit re-pair requirement", err)
+			}
+			if client.PairKeys != nil {
+				t.Fatal("unverified receiver keys were installed")
+			}
+		})
+	}
+}
+
+func TestRestoreSavedPairingRestoresPinnedHAPIdentity(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiverPublic, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
 	client := airplay.NewAirPlayClient("127.0.0.1", 7000)
 	err = restoreSavedPairing(client, &airplay.SavedCredentials{
-		PairingID:       "pair-id",
-		Ed25519Public:   pub,
-		Ed25519Seed:     priv.Seed(),
-		PairingProtocol: airplay.PairingProtocolRaw,
+		PairingID: "pair-id", Ed25519Public: pub, Ed25519Seed: priv.Seed(), PairingProtocol: airplay.PairingProtocolHAP,
+		ReceiverID: "receiver-id", ReceiverPublic: receiverPublic,
 	})
 	if err != nil {
 		t.Fatalf("restoreSavedPairing: %v", err)
 	}
-	if got := client.PairingProtocol(); got != airplay.PairingProtocolRaw {
-		t.Fatalf("restored protocol = %q, want raw", got)
+	if got := client.PairingProtocol(); got != airplay.PairingProtocolHAP {
+		t.Fatalf("restored protocol = %q, want HAP", got)
+	}
+	if client.PairKeys.ReceiverID != "receiver-id" || !receiverPublic.Equal(client.PairKeys.ReceiverPublic) {
+		t.Fatal("verified receiver identity was not restored")
 	}
 }

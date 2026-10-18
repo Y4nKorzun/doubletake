@@ -3,6 +3,7 @@ package airplay
 import (
 	"encoding/hex"
 	"fmt"
+	"math"
 )
 
 // data or hex string
@@ -32,12 +33,19 @@ type plistNumber int
 func (n *plistNumber) UnmarshalPlist(unmarshal func(interface{}) error) error {
 	var i int64
 	if unmarshal(&i) == nil {
+		if i < 0 || int64(int(i)) != i {
+			return fmt.Errorf("display dimension must be a nonnegative representable integer")
+		}
 		*n = plistNumber(i)
 		return nil
 	}
 	var f float64
 	if err := unmarshal(&f); err != nil {
 		return err
+	}
+	minimumInt := -int(^uint(0)>>1) - 1
+	if math.IsNaN(f) || math.IsInf(f, 0) || f < 0 || math.Trunc(f) != f || f >= -float64(minimumInt) {
+		return fmt.Errorf("display dimension must be a finite nonnegative representable integer")
 	}
 	*n = plistNumber(f)
 	return nil

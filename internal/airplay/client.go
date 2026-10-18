@@ -412,11 +412,9 @@ func cloneAirPlayDevice(device AirPlayDevice) AirPlayDevice {
 	return device
 }
 
-// SetPassword configures the password used to answer HTTP Digest challenges
-// from receivers with "Require Password" enabled. An empty password leaves
-// authentication disabled; a valid Digest challenge then surfaces as
-// ErrCredentialsRequired. Pair also calls this automatically when given a
-// non-empty PIN/password.
+// SetPassword configures the playback password, separately from an SRP pairing
+// PIN. It is only used after the receiver's identity and encrypted HAP control
+// channel have been verified.
 func (c *AirPlayClient) SetPassword(password string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -438,6 +436,9 @@ func (c *AirPlayClient) digestRetryHeader(method, uri string, respHeaders map[st
 	var statusErr *HTTPStatusError
 	if !errors.As(err, &statusErr) || statusErr.StatusCode != 401 {
 		return "", false, err
+	}
+	if !c.authenticatedControl() {
+		return "", false, fmt.Errorf("refusing Digest authentication before receiver verification and control encryption: %w", err)
 	}
 
 	// Indexing a nil map is fine; a 401 without the header just means we
@@ -465,10 +466,14 @@ func (c *AirPlayClient) digestRetryHeader(method, uri string, respHeaders map[st
 //
 // Must be called with c.mu held.
 func (c *AirPlayClient) preemptiveAuthHeader(method, uri string) (string, bool) {
-	if c.authPassword == "" || c.authChallenge == nil {
+	if !c.authenticatedControl() || c.authPassword == "" || c.authChallenge == nil {
 		return "", false
 	}
 	return authorizationHeader(DigestUsername, c.authPassword, c.authChallenge, method, uri), true
+}
+
+func (c *AirPlayClient) authenticatedControl() bool {
+	return c.encrypted && c.pairingProtocol == pairingProtocolHAP && c.PairKeys.hasReceiverIdentity()
 }
 
 // logIfAuthRejected reports a second 401 distinctly from the first. Reaching
@@ -500,7 +505,22 @@ func (c *AirPlayClient) Connect(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("dial %s: %w", addr, err)
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.conn != nil {
+		_ = c.conn.Close()
+	}
 	c.conn = conn
+	c.encrypted = false
+	c.encWriteKey, c.encReadKey, c.encCipher = nil, nil, nil
+	c.encWriteNonce, c.encReadNonce = 0, 0
+	c.authChallenge = nil
+	c.fpKey, c.fpIV, c.FpEkey, c.fpM3, c.fpAesKey = nil, nil, nil, nil, nil
+	c.streamKey, c.streamIV = nil, nil
+	if c.PairKeys != nil {
+		c.PairKeys.SharedSecret, c.PairKeys.WriteKey, c.PairKeys.ReadKey = nil, nil, nil
+		c.PairKeys.MixFairPlayKey = false
+	}
 	return nil
 }
 
@@ -529,7 +549,7 @@ func (c *AirPlayClient) getInfoWithTimeout(timeout time.Duration) (*ReceiverInfo
 
 	// Log response structure without copying peer-supplied values into logs.
 	var fullInfo map[string]interface{}
-	if _, err2 := plist.Unmarshal(resp, &fullInfo); err2 == nil {
+	if _, err2 := unmarshalNetworkPlist(resp, &fullInfo); err2 == nil {
 		dbg("[INFO] full /info response keys: %v", func() []string {
 			keys := make([]string, 0, len(fullInfo))
 			for k := range fullInfo {
@@ -540,7 +560,7 @@ func (c *AirPlayClient) getInfoWithTimeout(timeout time.Duration) (*ReceiverInfo
 	}
 
 	var info ReceiverInfo
-	if _, err := plist.Unmarshal(resp, &info); err != nil {
+	if _, err := unmarshalNetworkPlist(resp, &info); err != nil {
 		return nil, fmt.Errorf("decode info plist: %w", err)
 	}
 	info.Server = responseHeaders["server"]
@@ -608,7 +628,7 @@ func (c *AirPlayClient) applyReceiverInfoUpdate(update map[string]interface{}, s
 	if _, ok := update["displays"]; ok {
 		info.Displays = nil
 	}
-	if _, err := plist.Unmarshal(body, &info); err != nil {
+	if _, err := unmarshalNetworkPlist(body, &info); err != nil {
 		return nil, fmt.Errorf("decode receiver info update: %w", err)
 	}
 	if _, hasFeatures := update["features"]; !hasFeatures {
@@ -750,9 +770,6 @@ func parseTXTWire(data []byte) map[string]string {
 func (c *AirPlayClient) Pair(ctx context.Context, pin string) error {
 	if pin == "" {
 		return ErrPINRequired
-	}
-	if c.info != nil && c.info.RequiredPairingCredential() == PairingCredentialPassword {
-		c.SetPassword(pin)
 	}
 	return c.pairWithPIN(ctx, pin)
 }

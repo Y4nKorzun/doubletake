@@ -14,11 +14,13 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"doubletake/internal/airplay"
 	"doubletake/internal/daemon"
+	"golang.org/x/sys/unix"
 )
 
 func parseXID(s string) (uint64, error) {
@@ -60,7 +62,8 @@ func parsePortRange(s string) (int, int, error) {
 func main() {
 	target := flag.String("target", "", "Apple TV IP address or hostname (skip discovery)")
 	port := flag.Int("port", 7000, "AirPlay port")
-	code := flag.String("code", "", "Pairing PIN shown on the receiver, or the password set on it when \"Require Password\" is enabled; prefer $DOUBLETAKE_CODE so it stays out of shell history and ps output")
+	code := flag.String("code", "", "SRP pairing PIN shown on the receiver; prefer the interactive prompt or $DOUBLETAKE_CODE")
+	password := flag.String("password", "", "Separate receiver playback password, sent only after identity verification; prefer the interactive prompt or $DOUBLETAKE_PASSWORD")
 	credFile := flag.String("creds", airplay.DefaultCredentialsPath(), "Path to saved pairing credentials")
 	credBackend := flag.String("cred-backend", "file", "Credential storage backend: file or keyring (system keyring via Secret Service)")
 	forcePair := flag.Bool("pair", false, "Force new pairing even if credentials exist")
@@ -80,6 +83,7 @@ func main() {
 	x11WindowID := flag.String("x11-window-id", "", "X11 window id to capture, decimal or 0xhex")
 	x11WindowName := flag.String("x11-window-name", "", "X11 window name to capture; prefer -x11-window-id")
 	noCursor := flag.Bool("no-cursor", false, "Don't show the mouse cursor in the captured video")
+	portalOnly := flag.Bool("portal-only", false, "Require an ephemeral desktop-portal screen grant without direct display access")
 	flag.Parse()
 	if err := airplay.ValidateHWAccel(*hwaccel); err != nil {
 		log.Fatalf("invalid -hwaccel: %v", err)
@@ -96,6 +100,10 @@ func main() {
 	credential := *code
 	if env := os.Getenv("DOUBLETAKE_CODE"); env != "" {
 		credential = env
+	}
+	playbackPassword := *password
+	if env := os.Getenv("DOUBLETAKE_PASSWORD"); env != "" {
+		playbackPassword = env
 	}
 
 	airplay.SetTargetLatency(time.Duration(*targetLatencyMs) * time.Millisecond)
@@ -120,6 +128,8 @@ func main() {
 			NoAudio:     *noAudio,
 			ShowCursor:  !*noCursor,
 			Code:        credential,
+			Password:    playbackPassword,
+			PortalOnly:  *portalOnly,
 		})
 		return
 	}
@@ -162,7 +172,7 @@ func main() {
 		addr = device.IP
 		*port = device.Port
 		advertisement = device
-		fmt.Printf("selected: %s (%s:%d)\n", device.Name, device.IP, device.Port)
+		fmt.Printf("selected: %q (%s:%d)\n", device.Name, device.IP, device.Port)
 	}
 
 	newClient := func() *airplay.AirPlayClient {
@@ -175,7 +185,7 @@ func main() {
 		return airplay.NewAirPlayClient(addr, *port)
 	}
 	client := newClient()
-	client.SetPassword(credential)
+	client.SetPassword(playbackPassword)
 	if err := client.Connect(ctx); err != nil {
 		log.Fatalf("connect failed: %v", err)
 	}
@@ -185,14 +195,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("get info failed: %v", err)
 	}
-	log.Printf("connected to: %s (model: %s, initialVolume: %.1f)", info.Name, info.Model, info.InitialVolume)
-	if credential == "" && info.RequiresPassword() {
-		credential = readCredential(bufio.NewReader(os.Stdin), "Enter the receiver's configured password: ")
-		if credential == "" {
-			log.Fatal("password cannot be empty")
-		}
-		client.SetPassword(credential)
-	}
+	log.Printf("connected to: %q (model: %q, initialVolume: %.1f)", info.Name, info.Model, info.InitialVolume)
 
 	// Only an explicit -pair may replace an existing receiver identity.
 	needFullPair := *forcePair
@@ -204,7 +207,10 @@ func main() {
 
 	var savedCreds *airplay.SavedCredentials
 	if !needFullPair {
-		savedCreds = credStore.Lookup(info.DeviceID)
+		savedCreds, err = credStore.LookupEntry(info.DeviceID)
+		if err != nil {
+			log.Fatalf("cannot verify saved receiver identity: %v", err)
+		}
 	}
 
 	savePairingCredentials := func() {
@@ -223,8 +229,7 @@ func main() {
 			value = credentialOrPrompt("", client, expectPIN)
 		}
 		if passwordRequiresPairing(info) {
-			credential = value
-			client.SetPassword(value)
+			playbackPassword = value
 		}
 		if err := client.Pair(ctx, value); err != nil {
 			log.Fatalf("pairing failed: %v", err)
@@ -243,14 +248,23 @@ func main() {
 		}
 	} else {
 		if passwordRequiresPairing(info) {
-			pairWithCredential(credential, false)
-		} else if info.RequiresPassword() {
-			pairWithCredential("", true)
+			value := playbackPassword
+			if value == "" {
+				value = readCredential(bufio.NewReader(os.Stdin), "Enter the receiver's configured SRP pairing password: ")
+			}
+			pairWithCredential(value, false)
 		} else {
 			pairWithCredential(credential, true)
 		}
 	}
 	log.Println("pairing complete")
+	if info.RequiresPassword() && playbackPassword == "" {
+		playbackPassword = readCredential(bufio.NewReader(os.Stdin), "Enter the receiver's configured playback password: ")
+		if playbackPassword == "" {
+			log.Fatal("playback password cannot be empty")
+		}
+	}
+	client.SetPassword(playbackPassword)
 
 	// FairPlay setup — establishes fp-setup state and ekey/eiv used for the
 	// final encrypted mirror stream. Pair-verify and FairPlay are both needed
@@ -288,6 +302,7 @@ func main() {
 		X11WindowID:   xid,
 		X11WindowName: *x11WindowName,
 		ShowCursor:    !*noCursor,
+		PortalOnly:    *portalOnly,
 	}
 	if *testMode {
 		if *noAudio {
@@ -301,7 +316,11 @@ func main() {
 			return airplay.PrepareTestCapture(ctx, cfg)
 		}
 		restoreToken := ""
-		if creds := credStore.Lookup(info.DeviceID); creds != nil {
+		creds, err := credStore.LookupEntry(info.DeviceID)
+		if err != nil {
+			return nil, err
+		}
+		if creds != nil {
 			restoreToken = creds.RestoreToken
 		}
 		cfg.RestoreToken = restoreToken
@@ -391,11 +410,11 @@ func main() {
 		// /info. They reveal it only by challenging the first media SETUP. Keep
 		// the completed pairing/FairPlay state and running capture, configure the
 		// cached Digest challenge, and retry this setup exactly once.
-		credential = readCredential(bufio.NewReader(os.Stdin), "Enter the code shown on the receiver, or its configured password: ")
-		if credential == "" {
-			log.Fatal("receiver code/password cannot be empty")
+		playbackPassword = readCredential(bufio.NewReader(os.Stdin), "Enter the receiver's configured playback password: ")
+		if playbackPassword == "" {
+			log.Fatal("playback password cannot be empty")
 		}
-		client.SetPassword(credential)
+		client.SetPassword(playbackPassword)
 		if startedCodec != "" {
 			// A late Digest challenge may expose richer authenticated display
 			// metadata on the retry. The running encoder is single-use, so pin
@@ -496,21 +515,64 @@ func restoreSavedPairing(client *airplay.AirPlayClient, saved *airplay.SavedCred
 	return client.RestorePairingCredentials(saved)
 }
 
-func forcePairUsesTransient(info *airplay.ReceiverInfo) bool {
-	return info != nil && info.RequiresPassword() &&
-		info.RequiredPairingCredential() == airplay.PairingCredentialNone
+func readCredential(reader *bufio.Reader, prompt string) string {
+	value, err := readCredentialInput(reader, prompt, os.Stdin)
+	if err != nil {
+		log.Fatalf("failed to read credential: %v", err)
+	}
+	return value
 }
 
-func readCredential(reader *bufio.Reader, prompt string) string {
+func readCredentialInput(reader *bufio.Reader, prompt string, input *os.File) (value string, err error) {
 	fmt.Print(prompt)
+	fd := int(input.Fd())
+	original, terminalErr := unix.IoctlGetTermios(fd, unix.TCGETS)
+	if terminalErr != nil && !errors.Is(terminalErr, unix.ENOTTY) {
+		return "", fmt.Errorf("inspect credential terminal: %w", terminalErr)
+	}
+	if terminalErr == nil {
+		interrupts := make(chan os.Signal, 1)
+		signal.Notify(interrupts, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+		withoutEcho := *original
+		withoutEcho.Lflag &^= unix.ECHO | unix.ECHONL
+		if err := unix.IoctlSetTermios(fd, unix.TCSETS, &withoutEcho); err != nil {
+			signal.Stop(interrupts)
+			return "", fmt.Errorf("disable credential echo: %w", err)
+		}
+		done := make(chan struct{})
+		var restoreOnce sync.Once
+		var restoreErr error
+		restore := func() {
+			restoreOnce.Do(func() { restoreErr = unix.IoctlSetTermios(fd, unix.TCSETS, original) })
+		}
+		defer func() {
+			restore()
+			signal.Stop(interrupts)
+			close(done)
+			if prompt != "" {
+				fmt.Println()
+			}
+			if restoreErr != nil {
+				err = errors.Join(err, fmt.Errorf("restore credential terminal: %w", restoreErr))
+			}
+		}()
+		go func() {
+			select {
+			case received := <-interrupts:
+				restore()
+				os.Exit(128 + int(received.(syscall.Signal)))
+			case <-done:
+			}
+		}()
+	}
 	// Read the whole line rather than using fmt.Scanln, which stops at the
 	// first space and would silently truncate a password containing one.
 	line, err := reader.ReadString('\n')
 	if err != nil && !errors.Is(err, io.EOF) {
-		log.Fatalf("failed to read credential: %v", err)
+		return "", err
 	}
 	line = strings.TrimRight(line, "\r\n")
-	return line
+	return line, nil
 }
 
 func selectDevice(ctx context.Context) (*airplay.AirPlayDevice, error) {
@@ -532,7 +594,7 @@ func selectDevice(ctx context.Context) (*airplay.AirPlayDevice, error) {
 
 	fmt.Println("\navailable devices:")
 	for i, d := range devices {
-		fmt.Printf("  [%d] %s (%s) - %s\n", i+1, d.Name, d.Model, d.IP)
+		fmt.Printf("  [%d] %q (%q) - %s\n", i+1, d.Name, d.Model, d.IP)
 	}
 
 	fmt.Print("\nselect device [1]: ")

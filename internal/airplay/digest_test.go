@@ -178,6 +178,7 @@ func TestDigestRetryHeader(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			c := &AirPlayClient{authPassword: tt.password}
+			authenticateTransportTestClient(t, c)
 			hdr, ok, gotErr := c.digestRetryHeader("SETUP", "rtsp://host/1", tt.headers, tt.err)
 			if ok != tt.wantOK {
 				t.Fatalf("digestRetryHeader ok = %v, want %v", ok, tt.wantOK)

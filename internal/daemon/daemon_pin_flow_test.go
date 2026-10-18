@@ -164,7 +164,7 @@ func TestPINRequiredPairingStaysOnOriginalConnection(t *testing.T) {
 	pinFlowWaitForState(t, d, StateIdle)
 }
 
-func TestModernPasswordAndPINFlagsUseTransientPairingWithoutStartingDisplay(t *testing.T) {
+func TestModernPlaybackPasswordStillRequiresAuthenticatedPINPairing(t *testing.T) {
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -184,7 +184,7 @@ func TestModernPasswordAndPINFlagsUseTransientPairingWithoutStartingDisplay(t *t
 
 	requestSeen := make(chan pinFlowRequest, 3)
 	serverDone := make(chan pinFlowServerResult, 1)
-	go runPasswordPrecedenceReceiver(listener, infoBody, requestSeen, serverDone)
+	go runPINFlowReceiver(listener, infoBody, requestSeen, serverDone)
 
 	host, portText, err := net.SplitHostPort(listener.Addr().String())
 	if err != nil {
@@ -199,6 +199,7 @@ func TestModernPasswordAndPINFlagsUseTransientPairingWithoutStartingDisplay(t *t
 		CredBackend: "file",
 		CredFile:    filepath.Join(t.TempDir(), "credentials.json"),
 		NoAudio:     true,
+		Password:    "separate playback password",
 	})
 	if err != nil {
 		t.Fatalf("create daemon: %v", err)
@@ -216,24 +217,43 @@ func TestModernPasswordAndPINFlagsUseTransientPairingWithoutStartingDisplay(t *t
 	}
 
 	request = pinFlowNextRequest(t, requestSeen)
-	if request.method != "POST" || request.path != "/pair-setup" {
-		t.Fatalf("request after /info = %s %s, want transient POST /pair-setup", request.method, request.path)
+	if request.method != "POST" || request.path != "/pair-pin-start" {
+		t.Fatalf("request after /info = %s %s, want POST /pair-pin-start", request.method, request.path)
 	}
-	if got := request.headers["x-apple-hkp"]; got != "4" {
-		t.Fatalf("pair-setup X-Apple-HKP = %q, want transient type 4", got)
+	if got := request.headers["x-apple-hkp"]; got != "5" {
+		t.Fatalf("PIN-start X-Apple-HKP = %q, want authenticated type 5", got)
 	}
-	if got := pinFlowTLVValue(request.body, 0x13); !bytes.Equal(got, []byte{0x10, 0, 0, 0}) {
-		t.Fatalf("pair-setup transient flags = %x, want 10000000", got)
+	pinFlowWaitForState(t, d, StatePINRequired)
+	status := d.handleStatus()
+	if !status.NeedsPIN || status.CredentialKind != CredentialKindPIN {
+		t.Fatalf("modern password receiver did not require a separate pairing PIN: %+v", status)
+	}
+	select {
+	case request := <-requestSeen:
+		t.Fatalf("pairing advanced without the separate PIN: %s %s", request.method, request.path)
+	default:
+	}
+	response = d.handleConnect(Request{Cmd: "connect", Pin: "1234"})
+	if !response.OK {
+		t.Fatalf("PIN submission rejected: %+v", response)
+	}
+	request = pinFlowNextRequest(t, requestSeen)
+	if request.method != "POST" || request.path != "/pair-setup" || request.headers["x-apple-hkp"] != "5" {
+		t.Fatalf("PIN submission did not start authenticated HAP pairing: %+v", request)
+	}
+	if got := pinFlowTLVValue(request.body, 0x13); got != nil {
+		t.Fatalf("authenticated pair-setup contains forbidden transient flags: %x", got)
+	}
+	if got := pinFlowTLVValue(request.body, 0x06); !bytes.Equal(got, []byte{1}) {
+		t.Fatalf("authenticated pair-setup state = %x, want 01", got)
 	}
 
 	result := pinFlowServerResultWithin(t, serverDone)
 	if result.err != nil {
 		t.Fatalf("scripted receiver: %v", result.err)
 	}
-	for _, request := range result.requests {
-		if request.path == "/pair-pin-start" {
-			t.Fatalf("modern password+PIN flow called /pair-pin-start: %+v", result.requests)
-		}
+	if len(result.requests) != 3 {
+		t.Fatalf("request count = %d, want info, PIN display and authenticated pair-setup", len(result.requests))
 	}
 	pinFlowWaitForState(t, d, StateIdle)
 }
@@ -365,55 +385,6 @@ func runPINFlowReceiver(listener net.Listener, infoBody []byte, requestSeen chan
 			finish(fmt.Errorf("write response %d: %w", i+1, err))
 			return
 		}
-	}
-
-	finish(nil)
-}
-
-func runPasswordPrecedenceReceiver(listener net.Listener, infoBody []byte, requestSeen chan<- pinFlowRequest, done chan<- pinFlowServerResult) {
-	result := pinFlowServerResult{}
-	finish := func(err error) {
-		result.err = err
-		done <- result
-	}
-
-	conn, err := listener.Accept()
-	if err != nil {
-		finish(fmt.Errorf("accept connection: %w", err))
-		return
-	}
-	defer conn.Close()
-	reader := bufio.NewReader(conn)
-	request, err := readPINFlowRequest(conn, reader)
-	if err != nil {
-		finish(fmt.Errorf("read /info: %w", err))
-		return
-	}
-	result.requests = append(result.requests, request)
-	requestSeen <- request
-	if request.method != "GET" || request.path != "/info" {
-		finish(fmt.Errorf("first request = %s %s, want GET /info", request.method, request.path))
-		return
-	}
-	if err := writePINFlowResponse(conn, request.headers["cseq"], 200, "application/x-apple-binary-plist", infoBody); err != nil {
-		finish(fmt.Errorf("write /info: %w", err))
-		return
-	}
-
-	request, err = readPINFlowRequest(conn, reader)
-	if err != nil {
-		finish(fmt.Errorf("read password pair-setup: %w", err))
-		return
-	}
-	result.requests = append(result.requests, request)
-	requestSeen <- request
-	if request.method != "POST" || request.path != "/pair-setup" {
-		finish(fmt.Errorf("password request = %s %s, want POST /pair-setup", request.method, request.path))
-		return
-	}
-	if err := writePINFlowResponse(conn, request.headers["cseq"], 500, "", nil); err != nil {
-		finish(fmt.Errorf("write pair-setup response: %w", err))
-		return
 	}
 
 	finish(nil)

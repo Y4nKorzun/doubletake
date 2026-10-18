@@ -1,7 +1,10 @@
 package airplay
 
 import (
+	"bytes"
+	"encoding/binary"
 	"encoding/hex"
+	"math"
 	"testing"
 
 	"howett.net/plist"
@@ -68,6 +71,53 @@ func TestReceiverInfoRejectsUndecodablePK(t *testing.T) {
 	var got ReceiverInfo
 	if _, err := plist.Unmarshal(body, &got); err == nil {
 		t.Fatal("expected an error for a pk that is neither data nor hex")
+	}
+}
+
+func TestReceiverDisplayDimensionsRejectInvalidNumbers(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		value interface{}
+	}{
+		{name: "NaN", value: math.NaN()},
+		{name: "positive infinity", value: math.Inf(1)},
+		{name: "negative infinity", value: math.Inf(-1)},
+		{name: "negative integer", value: int64(-1)},
+		{name: "integer overflow", value: uint64(math.MaxUint64)},
+		{name: "real overflow", value: math.MaxFloat64},
+		{name: "fractional pixels", value: 1920.5},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			value := test.value
+			real, isReal := value.(float64)
+			if isReal && math.IsNaN(real) {
+				// The upstream serializer cannot deduplicate NaN map keys. Build a
+				// finite real object and replace its bits with a valid binary NaN.
+				value = 12345.6789012345
+			}
+			body, err := plist.Marshal(map[string]interface{}{
+				"displays": []interface{}{map[string]interface{}{
+					"widthPixels": value, "heightPixels": uint64(1080),
+				}},
+			}, plist.BinaryFormat)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if isReal && math.IsNaN(real) {
+				encodedReal := make([]byte, 9)
+				encodedReal[0] = 0x23
+				binary.BigEndian.PutUint64(encodedReal[1:], math.Float64bits(value.(float64)))
+				offset := bytes.Index(body, encodedReal)
+				if offset < 0 {
+					t.Fatal("finite real fixture was not encoded as a double")
+				}
+				binary.BigEndian.PutUint64(body[offset+1:], math.Float64bits(real))
+			}
+			var info ReceiverInfo
+			if _, err := plist.Unmarshal(body, &info); err == nil {
+				t.Fatal("receiver display accepted a nonfinite, negative, fractional or overflowing dimension")
+			}
+		})
 	}
 }
 

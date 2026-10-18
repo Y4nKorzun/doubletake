@@ -9,9 +9,10 @@ The upstream LGPL-3.0-or-later license and incorporated GPL notices are retained
 
 This fork verifies the receiver's SRP proof and signed identity during pairing,
 stores that identity with the pairing credentials, and verifies it on reconnect.
-Verification failures stop the connection instead of silently pairing again.
-Credentials are replaced atomically with owner-only permissions. Debug logs no
-longer print session keys or plaintext video samples.
+Verification failures and unavailable credential storage stop the connection.
+Credentials are replaced atomically with owner-only permissions. Debug logs do
+not print session keys or plaintext media samples. Receiver-supplied binary
+plists have explicit size, graph-expansion, and nesting limits before decoding.
 
 First-time connections require authenticated PIN/password pairing. PIN-less
 transient pairing, plaintext control sessions, and `-no-encrypt` are disabled.
@@ -19,28 +20,70 @@ A receiver that supports only transient pairing or plaintext control is not
 supported by this fork. A modern receiver's playback password remains separate
 from its on-screen pairing PIN.
 
-For Linux to Mac, enable **AirPlay Receiver** on the Mac, use a trusted local
-network, and pair with the PIN displayed on that Mac:
+For the restricted launch profile, use Linux x86_64 with a Wayland screencast
+portal, Landlock ABI 6 or newer, bubblewrap, xdg-dbus-proxy, and a systemd user
+session with delegated resource controllers. Build with the exact Go 1.27.2 SDK:
 
 ```sh
-doubletake -target MAC_IP -pair
+python3 -I tools/build_safe.py --go ~/.cache/development-tools/go1.27.2/bin/go
 ```
 
-Later connections verify the stored receiver identity:
+The builder uses verified disk-backed temporary storage, persistent Go caches,
+read-only modules, and no CGO. The launcher checks a source and binary digest
+receipt and refuses a stale or modified artifact. It accepts a system-installed
+root-owned D-Bus proxy, or the cached Arch 0.1.9 executable with the pinned digest
+in `tools/run_safe.py`.
+
+Enable **AirPlay Receiver** on the Mac, use a trusted local network, and pair
+with the code displayed on that specific Mac. Use its numeric private IPv4
+address. First send generated video without accessing a real screen:
 
 ```sh
-doubletake -target MAC_IP
+python3 -I tools/run_safe.py MAC_IP --pair --synthetic
 ```
+
+Later connections verify the saved receiver identity. To share a real screen:
+
+```sh
+python3 -I tools/run_safe.py MAC_IP
+```
+
+The profile requests screen selection through the desktop portal on each run,
+without storing a persistent screen grant. It disables audio and hardware
+encoding. The sandbox exposes neither the host home nor direct Wayland, X11,
+audio, GPU, or secret-service access. Landlock also blocks host abstract UNIX
+sockets and signals outside the sandbox. The D-Bus proxy permits only screencast
+operations and their request/session lifecycle. The whole sender process tree is
+limited to 768 MiB RAM, 128 MiB swap, 96 tasks, and two CPUs' worth of runtime.
+Interrupting the launcher stops its owned systemd scope before temporary cleanup.
+
+Pairing credentials persist only in `~/.local/share/doubletake-safe/config`.
+The network namespace is shared for AirPlay TCP/UDP: this profile is not an
+outbound network firewall. Pair only with a device you control on a trusted LAN.
+The direct CLI, audio capture, daemon, and optional GPU paths have broader access
+than this launch profile.
 
 Upstream credentials lack the verified receiver key and require one explicit
 `-pair` after checking the destination device. The daemon also stops on an
 identity mismatch; repair pairing through the CLI only after checking the Mac.
 Optional system-keyring storage remains available with `-cred-backend keyring`.
-Run as your normal user and restrict inbound AirPlay UDP traffic to the receiver.
+For direct CLI use, `-code` / `DOUBLETAKE_CODE` supplies the pairing PIN;
+`-password` / `DOUBLETAKE_PASSWORD` supplies a separate playback password. Digest
+authentication is permitted only after receiver verification and control-channel
+encryption. Receivers demanding Digest before pairing are refused. Interactive
+PINs and passwords are hidden while typing, with terminal state restored on exit.
 
-These source changes have not yet been build-tested or validated with a physical
-receiver. They do not constitute a complete security audit. The device list below
-records upstream compatibility, not validation of this fork.
+Focused security tests cover forged pairing proofs/signatures, credential errors,
+Digest disclosure, malformed plists, microphone fallback, and resource bounds.
+Native sandbox checks cover filesystem/desktop IPC isolation, filtered portal
+access, and the kernel's actual cgroup limits. These checks do not constitute a
+complete security audit. The device list below records upstream compatibility.
+
+Local validation on 2026-10-18: the Go suite passed 988 tests/subtests with eight
+optional/platform-specific skips; all 32 build/launcher/isolation checks passed.
+`go mod verify` passed, and `govulncheck` found no reachable Go vulnerabilities.
+Encrypted synthetic streaming to local test receivers passed. Native Mac
+pairing and real-screen streaming still require a physical-receiver check.
 
 ## Features
 

@@ -11,8 +11,22 @@ import (
 	"doubletake/internal/airplay"
 )
 
+func daemonSocketTestDirectory(t *testing.T) string {
+	t.Helper()
+	directory, err := os.MkdirTemp(os.TempDir(), "dt-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(directory); err != nil {
+			t.Errorf("remove owned daemon test directory: %v", err)
+		}
+	})
+	return directory
+}
+
 func TestRunRejectsSecondDaemonWithoutRemovingLiveSocket(t *testing.T) {
-	socketPath := filepath.Join(t.TempDir(), "doubletake.sock")
+	socketPath := filepath.Join(daemonSocketTestDirectory(t), "doubletake.sock")
 	lockFile, err := acquireInstanceLock(socketPath)
 	if err != nil {
 		t.Fatalf("acquire first daemon lock: %v", err)
@@ -51,7 +65,7 @@ func TestRunRejectsSecondDaemonWithoutRemovingLiveSocket(t *testing.T) {
 }
 
 func TestRunRejectsLiveDaemonThatPredatesInstanceLock(t *testing.T) {
-	socketPath := filepath.Join(t.TempDir(), "doubletake.sock")
+	socketPath := filepath.Join(daemonSocketTestDirectory(t), "doubletake.sock")
 	listener, err := net.Listen("unix", socketPath)
 	if err != nil {
 		t.Fatalf("listen as old daemon: %v", err)

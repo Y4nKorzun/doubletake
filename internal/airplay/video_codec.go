@@ -17,7 +17,12 @@ const (
 	VideoCodecHEVC VideoCodec = "hevc"
 )
 
-const featureScreenMultiCodec uint = 42
+const (
+	featureScreenMultiCodec   uint = 42
+	maximumEncodedVideoWidth       = 3840
+	maximumEncodedVideoHeight      = 2160
+	maximumEncodedVideoPixels      = maximumEncodedVideoWidth * maximumEncodedVideoHeight
+)
 
 func normalizeVideoCodec(codec VideoCodec) VideoCodec {
 	if codec == "" {
@@ -68,7 +73,10 @@ func (i *ReceiverInfo) selectVideo(requested VideoCodec, automaticHEVCAvailable 
 
 	switch requested {
 	case VideoCodecH264:
-		width, height := i.MirrorSize()
+		width, height, err := i.videoCanvas(VideoCodecH264)
+		if err != nil {
+			return videoSelection{}, err
+		}
 		return videoSelection{codec: VideoCodecH264, width: width, height: height, reason: "explicit H.264"}, nil
 	case VideoCodecHEVC:
 		width, height, err := i.videoCanvas(VideoCodecHEVC)
@@ -77,7 +85,10 @@ func (i *ReceiverInfo) selectVideo(requested VideoCodec, automaticHEVCAvailable 
 		}
 		return videoSelection{codec: VideoCodecHEVC, width: width, height: height, reason: "explicit HEVC"}, nil
 	case VideoCodecAuto:
-		width, height := i.MirrorSize()
+		width, height, err := i.videoCanvas(VideoCodecH264)
+		if err != nil {
+			return videoSelection{}, err
+		}
 		return videoSelection{codec: VideoCodecH264, width: width, height: height, reason: "automatic compatibility path"}, nil
 	default:
 		panic("validated video codec has no selection policy")
@@ -111,10 +122,13 @@ func (i *ReceiverInfo) maximumVideoCanvas() (int, int) {
 	if maximumW <= 0 || maximumH <= 0 {
 		return 0, 0
 	}
-	return fitVideoSize(maximumW, maximumH, 3840, 2160)
+	return fitVideoSize(maximumW, maximumH, maximumEncodedVideoWidth, maximumEncodedVideoHeight)
 }
 
 func fitVideoSize(width, height, maximumW, maximumH int) (int, int) {
+	if width <= 0 || height <= 0 || maximumW <= 0 || maximumH <= 0 {
+		return 0, 0
+	}
 	if width <= maximumW && height <= maximumH {
 		return width, height
 	}
@@ -132,8 +146,24 @@ func (i *ReceiverInfo) videoCanvas(codec VideoCodec) (int, int, error) {
 		// support has been established. The ordinary H.264 path uses the nominal
 		// PixelSize instead.
 		width, height := i.maximumVideoCanvas()
-		return width, height, nil
+		return boundedVideoCanvas(width, height)
 	}
 	width, height := i.MirrorSize()
+	return boundedVideoCanvas(width, height)
+}
+
+func boundedVideoCanvas(width, height int) (int, int, error) {
+	if width == 0 && height == 0 {
+		// Missing display metadata must not select the source's unbounded native
+		// resolution. Use the ordinary baseline receiver canvas instead.
+		return 1280, 720, nil
+	}
+	if width < 2 || height < 2 {
+		return 0, 0, fmt.Errorf("receiver advertised an unusable video canvas %dx%d", width, height)
+	}
+	width, height = fitVideoSize(width, height, maximumEncodedVideoWidth, maximumEncodedVideoHeight)
+	if width < 2 || height < 2 || width > maximumEncodedVideoWidth || height > maximumEncodedVideoHeight || height > maximumEncodedVideoPixels/width {
+		return 0, 0, fmt.Errorf("receiver video canvas cannot fit the encoding resource limits")
+	}
 	return width, height, nil
 }

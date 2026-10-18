@@ -101,7 +101,9 @@ type Config struct {
 	DirectKey   bool
 	NoAudio     bool
 	ShowCursor  bool
-	Code        string // default pairing/Digest credential; request Pin overrides it
+	Code        string // default SRP pairing PIN; request Pin overrides it
+	Password    string // separate playback password, used only after receiver verification
+	PortalOnly  bool
 }
 
 func (d *Daemon) mirrorStreamConfig() airplay.StreamConfig {
@@ -873,6 +875,7 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 
 	// A modern receiver's playback password is separate from its pairing PIN.
 	credential := d.cfg.Code
+	playbackPassword := d.cfg.Password
 	if suppliedCredential != "" {
 		credential = suppliedCredential
 	}
@@ -890,7 +893,7 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 		if next == nil {
 			next = airplay.NewAirPlayClient(target, port)
 		}
-		next.SetPassword(credential)
+		next.SetPassword(playbackPassword)
 		if err := next.Connect(ctx); err != nil {
 			return nil, nil, err
 		}
@@ -929,18 +932,21 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 	}
 
 	deviceID := info.DeviceID
-	savedCreds := d.credStore.Lookup(deviceID)
+	savedCreds, err := d.credStore.LookupEntry(deviceID)
+	if err != nil {
+		removeStream(fmt.Sprintf("cannot verify saved receiver identity: %v", err))
+		return
+	}
 	screenCastRestoreToken := ""
 	if savedCreds != nil {
 		screenCastRestoreToken = savedCreds.RestoreToken
 	}
 
-	log.Printf("[daemon] connected to %s (model: %s, deviceID: %s)", info.Name, info.Model, deviceID)
+	log.Printf("[daemon] connected to %q (model: %q, deviceID: %q)", info.Name, info.Model, deviceID)
 
 	pairWithCredentialValue := func(value string) error {
 		if info.RequiredPairingCredential() == airplay.PairingCredentialPassword {
-			credential = value
-			client.SetPassword(value)
+			playbackPassword = value
 		}
 		if err := client.Pair(ctx, value); err != nil {
 			return err
@@ -950,7 +956,7 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 				client.PairingProtocol()); err != nil {
 				return fmt.Errorf("save verified receiver identity: %w", err)
 			} else {
-				log.Printf("[daemon] credentials saved for %s (deviceID: %s)", info.Name, deviceID)
+				log.Printf("[daemon] credentials saved for %q (deviceID: %q)", info.Name, deviceID)
 			}
 		}
 		return nil
@@ -986,7 +992,7 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 		entry.state = StatePINRequired
 		d.mu.Unlock()
 
-		log.Printf("[daemon] %s required for %s — waiting for user input", kind, info.Name)
+		log.Printf("[daemon] %s required for %q — waiting for user input", kind, info.Name)
 		select {
 		case value := <-entry.credentialCh:
 			return value, nil
@@ -1012,7 +1018,7 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 			return
 		} else {
 			paired = true
-			log.Printf("[daemon] pair-verify succeeded for %s", info.Name)
+			log.Printf("[daemon] pair-verify succeeded for %q", info.Name)
 		}
 	} else if savedCreds != nil {
 		log.Printf("[daemon] saved credentials have no usable pair-verify keys, skipping")
@@ -1023,8 +1029,7 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 		pairingCredential := credential
 		if info.RequiredPairingCredential() == airplay.PairingCredentialPassword {
 			kind = CredentialKindPassword
-		} else if info.RequiresPassword() {
-			pairingCredential = ""
+			pairingCredential = playbackPassword
 		}
 		if pairingCredential == "" {
 			pairingCredential, err = waitForCredential(kind)
@@ -1040,15 +1045,15 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 	}
 
 	// A configured playback password is independent from authenticated pairing.
-	if info.RequiresPassword() && credential == "" {
+	if info.RequiresPassword() && playbackPassword == "" {
 		value, err := waitForCredential(CredentialKindPassword)
 		if err != nil {
 			removeStream(fmt.Sprintf("wait for password: %v", err))
 			return
 		}
-		credential = value
-		client.SetPassword(credential)
+		playbackPassword = value
 	}
+	client.SetPassword(playbackPassword)
 
 	// FairPlay setup
 	if err := client.FairPlaySetup(ctx); err != nil {
@@ -1098,7 +1103,11 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 		if startErr != nil {
 			if streamCfg.VideoCodec == airplay.VideoCodecAuto && codec == airplay.VideoCodecHEVC {
 				restoreToken := screenCastRestoreToken
-				if saved := d.credStore.Lookup(deviceID); saved != nil && saved.RestoreToken != "" {
+				saved, err := d.credStore.LookupEntry(deviceID)
+				if err != nil {
+					return airplay.VideoPreparationResult{}, err
+				}
+				if saved != nil && saved.RestoreToken != "" {
 					restoreToken = saved.RestoreToken
 				}
 				replacement, fallbackErr := d.prepareVideoCapture(ctx, restoreToken, deviceID, airplay.VideoCodecH264)
@@ -1121,7 +1130,7 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 		err,
 		func() (string, error) { return waitForCredential(CredentialKindPassword) },
 		func(value string) {
-			credential = value
+			playbackPassword = value
 			client.SetPassword(value)
 		},
 		func() error {
@@ -1165,7 +1174,7 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 	current.audioMuted = false
 	d.mu.Unlock()
 
-	log.Printf("[daemon] streaming to %s (%s) at %dx%d using %s",
+	log.Printf("[daemon] streaming to %q (%s) at %dx%d using %s",
 		info.Name, target, selectedCaptureKey.maxWidth, selectedCaptureKey.maxHeight, selectedCaptureKey.codec)
 	videoDone := make(chan error, 1)
 	go func() {
@@ -1277,6 +1286,7 @@ func (d *Daemon) prepareVideoCapture(ctx context.Context, restoreToken, deviceID
 		HWAccel:      d.cfg.HWAccel,
 		VideoCodec:   codec,
 		ShowCursor:   d.cfg.ShowCursor,
+		PortalOnly:   d.cfg.PortalOnly,
 		RestoreToken: restoreToken,
 	}
 	if deviceID != "" {
@@ -1440,6 +1450,7 @@ func (d *Daemon) getOrStartCaptureGroup(entry *activeStream, restoreToken, devic
 		MaxWidth:     key.maxWidth,
 		MaxHeight:    key.maxHeight,
 		ShowCursor:   d.cfg.ShowCursor,
+		PortalOnly:   d.cfg.PortalOnly,
 		RestoreToken: restoreToken,
 	}
 	if deviceID != "" {

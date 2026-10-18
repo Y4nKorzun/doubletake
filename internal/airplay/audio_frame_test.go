@@ -62,36 +62,32 @@ func TestPulseMonitorSourceSeparatesStallBufferFromFragment(t *testing.T) {
 
 func TestAudioMonitorSourceSelection(t *testing.T) {
 	for _, test := range []struct {
-		name        string
-		hasPulse    bool
-		monitor     string
-		hasPipeWire bool
-		wantSource  string
-		wantArgs    []string
+		name       string
+		hasPulse   bool
+		monitor    string
+		wantSource string
+		wantArgs   []string
 	}{
 		{
-			name: "Pulse monitor preferred when both plugins exist", hasPulse: true,
-			monitor: "test.monitor", hasPipeWire: true, wantSource: "pulse",
-			wantArgs: []string{"pulsesrc", "device=test.monitor", "buffer-time=250000", "latency-time=7982"},
-		},
-		{
-			name: "native Pulse monitor", hasPulse: true,
+			name: "explicit output monitor", hasPulse: true,
 			monitor: "test.monitor", wantSource: "pulse",
 			wantArgs: []string{"pulsesrc", "device=test.monitor", "buffer-time=250000", "latency-time=7982"},
 		},
 		{
-			name: "PipeWire fallback without Pulse plugin", hasPipeWire: true, wantSource: "pipewire",
-			wantArgs: []string{"pipewiresrc", "client-name=doubletake"},
+			name:    "missing Pulse plugin never selects default PipeWire input",
+			monitor: "test.monitor",
 		},
 		{
-			name: "PipeWire fallback without detected monitor", hasPulse: true,
-			hasPipeWire: true, wantSource: "pipewire",
-			wantArgs: []string{"pipewiresrc", "client-name=doubletake"},
+			name: "missing monitor never selects default input", hasPulse: true,
+		},
+		{
+			name: "microphone cannot be selected as an output monitor", hasPulse: true,
+			monitor: "alsa_input.pci-0000_00_1f.3.analog-stereo",
 		},
 		{name: "no source plugin", wantSource: ""},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			args, source := selectAudioMonitorSource(test.hasPulse, test.monitor, test.hasPipeWire, AudioCodecALAC)
+			args, source := selectAudioMonitorSource(test.hasPulse, test.monitor, AudioCodecALAC)
 			if source != test.wantSource {
 				t.Fatalf("source = %q, want %q", source, test.wantSource)
 			}

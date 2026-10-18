@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"golang.org/x/crypto/chacha20poly1305"
-	"howett.net/plist"
 )
 
 const (
@@ -279,7 +278,7 @@ func handleEventRequest(request eventRequest, clock *mediaClock, receivedAt time
 	}
 
 	var command map[string]interface{}
-	if _, err := plist.Unmarshal(request.body, &command); err != nil {
+	if _, err := unmarshalNetworkPlist(request.body, &command); err != nil {
 		return fmt.Errorf("decode event command: %w", err)
 	}
 	commandType, _ := command["type"].(string)

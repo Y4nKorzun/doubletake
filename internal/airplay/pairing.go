@@ -573,6 +573,9 @@ func (c *AirPlayClient) completeSRPExchange(ctx context.Context, pin string, sal
 
 	uHash := sha512.Sum512(append(padTo(clientPublic, 384), padTo(serverPublic, 384)...))
 	u := new(big.Int).SetBytes(uHash[:])
+	if u.Sign() == 0 {
+		return fmt.Errorf("M2: invalid SRP scrambling parameter")
+	}
 
 	// S = (B - k * g^x mod N)^(a + u*x) mod N
 	gx := new(big.Int).Exp(srpG, x, srpN)
@@ -581,6 +584,9 @@ func (c *AirPlayClient) completeSRPExchange(ctx context.Context, pin string, sal
 	diff := new(big.Int).Sub(B, kgx)
 	if diff.Sign() < 0 {
 		diff.Add(diff, srpN)
+	}
+	if diff.Sign() == 0 {
+		return fmt.Errorf("M2: invalid SRP shared-secret base")
 	}
 	exp := new(big.Int).Mul(u, x)
 	exp.Add(exp, a)

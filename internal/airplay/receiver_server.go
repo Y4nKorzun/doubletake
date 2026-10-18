@@ -950,7 +950,7 @@ func (s *ReceiverServer) info(sessionPrepared bool) map[string]any {
 
 func (c *receiverConnection) handleSetup(request receiverRequest) receiverResponse {
 	var setup map[string]any
-	if _, err := plist.Unmarshal(request.body, &setup); err != nil {
+	if _, err := unmarshalNetworkPlist(request.body, &setup); err != nil {
 		return receiverError(400, fmt.Errorf("decode SETUP plist: %w", err))
 	}
 	streams, err := receiverSetupStreams(setup)

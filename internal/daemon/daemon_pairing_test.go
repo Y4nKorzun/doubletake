@@ -39,23 +39,49 @@ func TestRequiredPairingCredentialKind(t *testing.T) {
 	}
 }
 
-func TestRestoreSavedPairingRestoresRawProtocol(t *testing.T) {
+func TestRestoreSavedPairingRejectsUnpinnedCredentials(t *testing.T) {
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("GenerateKey: %v", err)
 	}
+	for _, protocol := range []airplay.PairingProtocol{airplay.PairingProtocolRaw, airplay.PairingProtocolHAP} {
+		t.Run(string(protocol), func(t *testing.T) {
+			client := airplay.NewAirPlayClient("127.0.0.1", 7000)
+			err := restoreSavedPairing(client, &airplay.SavedCredentials{
+				PairingID: "pair-id", Ed25519Public: pub, Ed25519Seed: priv.Seed(), PairingProtocol: protocol,
+			})
+			if err == nil || !strings.Contains(err.Error(), "no verified receiver identity") {
+				t.Fatalf("restoreSavedPairing error = %v, want explicit re-pair requirement", err)
+			}
+			if client.PairKeys != nil {
+				t.Fatal("unverified receiver keys were installed")
+			}
+		})
+	}
+}
+
+func TestRestoreSavedPairingRestoresPinnedHAPIdentity(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiverPublic, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
 	client := airplay.NewAirPlayClient("127.0.0.1", 7000)
 	err = restoreSavedPairing(client, &airplay.SavedCredentials{
-		PairingID:       "pair-id",
-		Ed25519Public:   pub,
-		Ed25519Seed:     priv.Seed(),
-		PairingProtocol: airplay.PairingProtocolRaw,
+		PairingID: "pair-id", Ed25519Public: pub, Ed25519Seed: priv.Seed(), PairingProtocol: airplay.PairingProtocolHAP,
+		ReceiverID: "receiver-id", ReceiverPublic: receiverPublic,
 	})
 	if err != nil {
 		t.Fatalf("restoreSavedPairing: %v", err)
 	}
-	if got := client.PairingProtocol(); got != airplay.PairingProtocolRaw {
-		t.Fatalf("restored protocol = %q, want raw", got)
+	if got := client.PairingProtocol(); got != airplay.PairingProtocolHAP {
+		t.Fatalf("restored protocol = %q, want HAP", got)
+	}
+	if client.PairKeys.ReceiverID != "receiver-id" || !receiverPublic.Equal(client.PairKeys.ReceiverPublic) {
+		t.Fatal("verified receiver identity was not restored")
 	}
 }
 

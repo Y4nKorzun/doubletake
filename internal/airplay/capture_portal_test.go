@@ -22,7 +22,11 @@ import (
 const portalTestInterface = "org.doubletake.PortalTest"
 
 func TestProbeWaylandDisplayUsesCompositorSocket(t *testing.T) {
-	runtimeDir := t.TempDir()
+	runtimeDir, err := os.MkdirTemp(os.TempDir(), "dt-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(runtimeDir) })
 	relativePath := "wayland-test"
 	absolutePath := filepath.Join(runtimeDir, relativePath)
 	listener, err := net.Listen("unix", absolutePath)
