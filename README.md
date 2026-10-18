@@ -36,7 +36,13 @@ in `tools/run_safe.py`.
 
 Enable **AirPlay Receiver** on the Mac, use a trusted local network, and pair
 with the code displayed on that specific Mac. Use its numeric private IPv4
-address. First send generated video without accessing a real screen:
+address. Set **Allow AirPlay for** to **Anyone on the Same Network**: Apple's
+**Current User** mode is restricted to devices signed in to the same Apple
+Account. See [Apple's receiver setup guide](https://support.apple.com/guide/mac-help/stream-video-and-audio-with-airplay-mchld7e543a0/mac).
+An HTTP 403 response to the PIN request can indicate a receiver access-policy
+restriction; check that setting before retrying.
+
+First send generated video without accessing a real screen:
 
 ```sh
 python3 -I tools/run_safe.py MAC_IP --pair --synthetic
@@ -82,8 +88,11 @@ complete security audit. The device list below records upstream compatibility.
 Local validation on 2026-10-18: the Go suite passed 988 tests/subtests with eight
 optional/platform-specific skips; all 32 build/launcher/isolation checks passed.
 `go mod verify` passed, and `govulncheck` found no reachable Go vulnerabilities.
-Encrypted synthetic streaming to local test receivers passed. Native Mac
-pairing and real-screen streaming still require a physical-receiver check.
+Encrypted synthetic streaming to local test receivers passed. A restricted
+launch successfully decoded a native Mac16,10's `/info` response, then stopped
+cleanly when that Mac denied the PIN request with HTTP 403. No screen or audio
+was captured. Successful native pairing and real-screen streaming remain
+unverified until the receiver permits pairing and its on-screen code is entered.
 
 ## Features
 
